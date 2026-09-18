@@ -127,6 +127,24 @@ def _install_stubs() -> None:
 
     msg_mod.Plain = Plain
 
+    core = _pkg("astrbot.core")
+    core_star = _pkg("astrbot.core.star")
+    core_star_ctx_mod = types.ModuleType("astrbot.core.star.context")
+
+    class CtxContext:
+        async def send_message(self, session, message_chain):
+            return True
+
+        @classmethod
+        def __subclasses__(cls):
+            return []
+
+    core_star_ctx_mod.Context = CtxContext
+    sys.modules["astrbot.core.star.context"] = core_star_ctx_mod
+    core_star.context = core_star_ctx_mod
+    core.star = core_star
+    astrbot.core = core
+
     sys.modules["astrbot"].api = api
 
 
@@ -135,6 +153,7 @@ _install_stubs()
 from astrbot.api.event import AstrMessageEvent  # noqa: E402
 from astrbot.api.message_components import Plain  # noqa: E402
 from astrbot.api.provider import LLMResponse  # noqa: E402
+from astrbot.core.star.context import Context as StarContext  # noqa: E402
 
 sys.path.insert(0, "/var/minis/workspace/astrbot_plugin_hide_thinking")
 from main import (  # noqa: E402
@@ -628,6 +647,134 @@ class TestPluginHooks(unittest.TestCase):
             self.assertEqual(captured, ["第一条 哈喽", "第二条 嗯嗯"])
             _run(asyncio.sleep(0.15))
             self.assertEqual(captured, texts)
+        finally:
+            _run(plugin.terminate())
+
+    def test_context_path_dedupes_tool_and_final(self):
+        sent = []
+
+        async def orig_cm(self_ctx, session, message_chain):
+            sent.append(message_chain.chain[0].text if message_chain.chain else "")
+            return True
+
+        async def orig_event_send(self_ev, message, *a, **k):
+            sent.append(message.chain[0].text if message.chain else "")
+            return "ok"
+
+        setattr(StarContext, "send_message", orig_cm)
+        setattr(AstrMessageEvent, "send", orig_event_send)
+        plugin = HideThinking(context=None, config={"enabled": True, "dedup_window": 0.05})
+        try:
+            _run(plugin.initialize())
+            sid = "aiocqhttp:GroupMessage:g12"
+            # 模型先调 send_message_to_user 工具：没空格版本
+            r = _run(
+                StarContext().send_message(
+                    sid,
+                    SimpleNamespace(
+                        chain=[Plain("37块了啊额度不是我能充的你自己看着办我又不能变钱出来")]
+                    ),
+                )
+            )
+            self.assertTrue(r)
+            self.assertEqual(sent, [])
+            # 结束正文：带空格版本，走 event.send
+            event = FakeEvent(umo=sid)
+            _run(
+                AstrMessageEvent.send(
+                    event,
+                    SimpleNamespace(
+                        chain=[Plain("37块了啊 额度不是我能充的 你自己看着办 我又不能变钱出来")]
+                    ),
+                )
+            )
+            self.assertEqual(
+                sent,
+                ["37块了啊 额度不是我能充的 你自己看着办 我又不能变钱出来"],
+            )
+        finally:
+            _run(plugin.terminate())
+
+    def test_context_path_flushes_single(self):
+        sent = []
+
+        async def orig_cm(self_ctx, session, message_chain):
+            sent.append(message_chain.chain[0].text if message_chain.chain else "")
+            return True
+
+        setattr(StarContext, "send_message", orig_cm)
+        plugin = HideThinking(context=None, config={"enabled": True, "dedup_window": 0.05})
+        try:
+            _run(plugin.initialize())
+            sid = "aiocqhttp:GroupMessage:g13"
+            _run(
+                StarContext().send_message(
+                    sid, SimpleNamespace(chain=[Plain("喏 可爱的给你 别得寸进尺啊宝宝")]
+                )
+                )
+            )
+            self.assertEqual(sent, [])
+            _run(asyncio.sleep(0.15))
+            self.assertEqual(sent, ["喏 可爱的给你 别得寸进尺啊宝宝"])
+        finally:
+            _run(plugin.terminate())
+
+    def test_context_path_cleans_eos_window0(self):
+        sent = []
+
+        async def orig_cm(self_ctx, session, message_chain):
+            sent.append(message_chain.chain[0].text if message_chain.chain else "")
+            return True
+
+        setattr(StarContext, "send_message", orig_cm)
+        plugin = HideThinking(context=None, config={"enabled": True, "dedup_window": 0})
+        try:
+            _run(plugin.initialize())
+            sid = "aiocqhttp:GroupMessage:g14"
+            _run(
+                StarContext().send_message(
+                    sid, SimpleNamespace(chain=[Plain("行不行啊<|eos|>")]
+                )
+                )
+            )
+            self.assertEqual(sent, ["行不行啊"])
+        finally:
+            _run(plugin.terminate())
+
+    def test_context_path_drops_final_space_variant_window0(self):
+        sent = []
+
+        async def orig_cm(self_ctx, session, message_chain):
+            sent.append(message_chain.chain[0].text if message_chain.chain else "")
+            return True
+
+        setattr(StarContext, "send_message", orig_cm)
+        plugin = HideThinking(context=None, config={"enabled": True, "dedup_window": 0})
+        try:
+            _run(plugin.initialize())
+            sid = "aiocqhttp:GroupMessage:g15"
+            _run(
+                StarContext().send_message(
+                    sid,
+                    SimpleNamespace(
+                        chain=[Plain("37块了啊 额度不是我能充的 你自己看着办 我又不能变钱出来")]
+                    ),
+                )
+            )
+            event = FakeEvent(umo=sid)
+            r = _run(
+                AstrMessageEvent.send(
+                    event,
+                    SimpleNamespace(
+                        chain=[Plain("37块了啊额度不是我能充的你自己看着办我又不能变钱出来")]
+                    ),
+                )
+            )
+            self.assertIsNone(r)
+            self.assertEqual(
+                sent,
+                ["37块了啊 额度不是我能充的 你自己看着办 我又不能变钱出来"],
+            )
         finally:
             _run(plugin.terminate())
 

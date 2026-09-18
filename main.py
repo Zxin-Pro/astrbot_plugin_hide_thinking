@@ -12,6 +12,11 @@ from astrbot.api.message_components import Plain
 from astrbot.api.provider import LLMResponse
 from astrbot.api.star import Context, Star, register
 
+try:  # 工具/插件主动发送走 Context.send_message，需要一并接管
+    from astrbot.core.star.context import Context as _StarContext
+except Exception:  # pragma: no cover - 老版本兜底
+    _StarContext = None
+
 # 模型常见思维链标签（英文 + 中文）
 _THINK_TAG_NAMES = frozenset(
     {
@@ -352,7 +357,7 @@ def _is_lark_reasoning_comp(comp: Any) -> bool:
     "astrbot_plugin_hide_thinking",
     "Zxin-Pro",
     "隐藏思考/结束符/工具调用泄漏，并折叠整段复读",
-    "1.7.0",
+    "1.8.0",
     "https://github.com/Zxin-Pro/astrbot_plugin_hide_thinking",
 )
 class HideThinking(Star):
@@ -443,10 +448,9 @@ class HideThinking(Star):
         items.append((now, text))
         self._recent[sid] = items[-_RECENT_MAX:]
 
-    def _apply_recent(self, event: Any, chain: list[Any]) -> list[Any]:
+    def _apply_recent_sid(self, sid: str, chain: list[Any]) -> list[Any]:
         if not self._collapse_duplicate() or not chain:
             return chain
-        sid = self._session_key(event)
         recents = self._purge_recent(sid)
         new_chain: list[Any] = []
         outgoing: list[str] = []
@@ -494,15 +498,15 @@ class HideThinking(Star):
             new_chain.append(comp)
         return new_chain
 
-    def _scrub_message(self, message: Any, event: Any = None) -> Any:
+    def _scrub_message(self, message: Any, sid: str | None = None) -> Any:
         if not self._enabled() or message is None:
             return message
         chain = getattr(message, "chain", None)
         if chain is None:
             return message
         new_chain = self._scrub_chain(list(chain))
-        if event is not None:
-            new_chain = self._apply_recent(event, new_chain)
+        if sid is not None:
+            new_chain = self._apply_recent_sid(sid, new_chain)
         try:
             message.chain = new_chain
         except Exception:
@@ -523,49 +527,58 @@ class HideThinking(Star):
             c.text for c in chain if isinstance(c, Plain) and c.text is not None
         )
 
-    async def _do_send(self, sid: str, orig: Any, event: Any, message: Any) -> None:
+    async def _flush_pending_message(
+        self, sid: str, flush: Any, message: Any
+    ) -> None:
         chain = getattr(message, "chain", None)
         if chain is not None:
-            chain = self._apply_recent(event, list(chain))
+            chain = self._apply_recent_sid(sid, list(chain))
             if not chain:
                 return
             try:
                 message.chain = chain
             except Exception:
                 pass
-        await orig(event, message)
+        await flush(message)
 
     async def _flush_sid(self, sid: str) -> None:
         item = self._pending.pop(sid, None)
         if not item:
             return
-        orig, event, message, task = item
+        flush, message, task = item
         if task is not None:
             task.cancel()
-        await self._do_send(sid, orig, event, message)
+        await self._flush_pending_message(sid, flush, message)
 
-    async def _buffer_send(self, sid: str, orig: Any, event: Any, message: Any) -> None:
+    async def _buffer_message(self, sid: str, flush: Any, message: Any) -> bool:
+        """纯文本消息进缓冲；同句不同空格只发更自然的那条。返回 True 表示已接管。"""
         item = self._pending.pop(sid, None)
         if item is not None:
-            p_orig, p_event, p_msg, p_task = item
+            p_flush, p_msg, p_task = item
             if p_task is not None:
                 p_task.cancel()
             p_text = self._plain_text_of(p_msg)
             i_text = self._plain_text_of(message)
             if p_text and _compact(p_text) == _compact(i_text):
                 if _ws_count(i_text) > _ws_count(p_text):
-                    await self._do_send(sid, orig, event, message)
+                    await self._flush_pending_message(sid, flush, message)
                 else:
-                    await self._do_send(sid, p_orig, p_event, p_msg)
-                return
-            await self._do_send(sid, p_orig, p_event, p_msg)
+                    await self._flush_pending_message(sid, p_flush, p_msg)
+                return True
+            await self._flush_pending_message(sid, p_flush, p_msg)
 
         async def _later() -> None:
             await asyncio.sleep(self._dedup_window)
             await self._flush_sid(sid)
 
-        task = asyncio.create_task(_later())
-        self._pending[sid] = (orig, event, message, task)
+        try:
+            task = asyncio.create_task(_later())
+        except Exception:
+            task = None
+            await self._flush_pending_message(sid, flush, message)
+            return True
+        self._pending[sid] = (flush, message, task)
+        return True
 
     def _iter_event_classes(self):
         seen: set[int] = set()
@@ -609,19 +622,20 @@ class HideThinking(Star):
                         logger.error("[HideThinking] send 清洗失败", exc_info=True)
                     finally:
                         plugin._patching = False
+                    sid = plugin._session_key(event)
                     if (
                         plugin._dedup_window > 0
                         and plugin._collapse_duplicate()
                         and plugin._is_pure_plain(message)
                     ):
-                        await plugin._buffer_send(
-                            plugin._session_key(event), orig, event, message
+                        await plugin._buffer_message(
+                            sid, lambda m: orig(event, m), message
                         )
                         return None
                     try:
                         chain = getattr(message, "chain", None)
                         if chain is not None:
-                            chain = plugin._apply_recent(event, list(chain))
+                            chain = plugin._apply_recent_sid(sid, list(chain))
                             if not chain:
                                 return None
                             message.chain = chain
@@ -631,15 +645,60 @@ class HideThinking(Star):
 
             return patched_send
 
+        def ctx_send_factory(orig):
+            async def patched_ctx_send(ctx_self, session, message_chain, *args, **kwargs):
+                if plugin._enabled() and not plugin._patching:
+                    plugin._patching = True
+                    try:
+                        message_chain = plugin._scrub_message(message_chain)
+                        chain = getattr(message_chain, "chain", None)
+                        if chain is not None and len(chain) == 0:
+                            return True
+                    except Exception:
+                        logger.error("[HideThinking] ctx send 清洗失败", exc_info=True)
+                    finally:
+                        plugin._patching = False
+                    try:
+                        sid = str(session)
+                    except Exception:
+                        sid = None
+                    if sid:
+                        if (
+                            plugin._dedup_window > 0
+                            and plugin._collapse_duplicate()
+                            and plugin._is_pure_plain(message_chain)
+                        ):
+                            await plugin._buffer_message(
+                                sid,
+                                lambda m: orig(ctx_self, session, m),
+                                message_chain,
+                            )
+                            return True
+                        try:
+                            chain = getattr(message_chain, "chain", None)
+                            if chain is not None:
+                                chain = plugin._apply_recent_sid(sid, list(chain))
+                                if not chain:
+                                    return True
+                                message_chain.chain = chain
+                        except Exception:
+                            logger.error(
+                                "[HideThinking] ctx send 去重失败", exc_info=True
+                            )
+                return await orig(ctx_self, session, message_chain, *args, **kwargs)
+
+            return patched_ctx_send
+
         def stream_factory(orig):
             async def patched_send_streaming(event, generator, *args, **kwargs):
                 if not plugin._enabled() or generator is None:
                     return await orig(event, generator, *args, **kwargs)
+                sid = plugin._session_key(event)
 
                 async def cleaned_gen():
                     async for chain in generator:
                         try:
-                            chain = plugin._scrub_message(chain, event)
+                            chain = plugin._scrub_message(chain, sid)
                             inner = getattr(chain, "chain", None)
                             if inner is not None and len(inner) == 0:
                                 continue
@@ -654,6 +713,8 @@ class HideThinking(Star):
         for cls in self._iter_event_classes():
             self._patch_method(cls, "send", send_factory)
             self._patch_method(cls, "send_streaming", stream_factory)
+        if _StarContext is not None:
+            self._patch_method(_StarContext, "send_message", ctx_send_factory)
         logger.info("[HideThinking] 已拦截 %s 个 send 出口", len(self._patched))
 
     def _remove_send_patch(self) -> None:

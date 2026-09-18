@@ -1,5 +1,5 @@
 name: astrbot_plugin_hide_thinking
 desc: 隐藏思考/结束符/工具调用泄漏，并折叠整段复读
-version: v1.7.0
+version: v1.8.0
 author: Zxin-Pro
 repo: https://github.com/Zxin-Pro/astrbot_plugin_hide_thinking

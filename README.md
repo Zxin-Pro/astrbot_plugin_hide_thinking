@@ -36,7 +36,13 @@ Grok / DeepSeek 等模型还会在正文里塞 `<think>…</think>`，以及漏�
 | strip_special | true | 删 `<|eos|>` 等结束符 |
 | collapse_duplicate | true | 整段复读只留一句，跨条尾巴重复也剪（忽略空格） |
 | strip_tool_call | true | 抽出工具调用里的人话，丢掉 XML 外壳 |
-| dedup_window | 2 | 去重等待窗口（秒）：同一句话两种空格写法先后到达时，只发空格更自然的那条；0 关闭缓冲。建议大于分段回复的间隔秒数 |
+| dedup_window | 2 | 去重等待窗口（秒）：合并同句不同空格的重复发送（含工具调用与正文双发）；0 关闭缓冲。建议大于分段回复的间隔秒数 |
+
+## 为什么会发两遍
+
+模型有时会中途调 `send_message_to_user` 工具发一遍消息（走 `Context.send_message`），结尾又把同样的话当正文发一遍。AstrBot 自带的防重复是逐字精确比对，两种写法空格不同就当成两条，全发出去。
+
+本插件把 `Context.send_message` 和 `event.send` 两条路都接管进同一个去重缓冲：同句不同空格只发空格更自然的那条。
 
 ## 安装
 
