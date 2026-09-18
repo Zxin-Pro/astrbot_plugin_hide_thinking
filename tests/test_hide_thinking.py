@@ -124,6 +124,7 @@ sys.path.insert(0, "/var/minis/workspace/astrbot_plugin_hide_thinking")
 from main import (  # noqa: E402
     HideThinking,
     clean_reply_text,
+    collapse_duplicated_text,
     strip_injected_reasoning,
     strip_special_tokens,
     strip_think_tags,
@@ -227,6 +228,38 @@ class TestStripSpecial(unittest.TestCase):
         self.assertEqual(strip_special_tokens(src), src)
 
 
+class TestCollapseDuplicate(unittest.TestCase):
+    def test_user_example(self):
+        src = "早啊宝宝 刚醒吗 赖床去吧早啊宝宝 刚醒吗 赖床去吧"
+        self.assertEqual(
+            collapse_duplicated_text(src),
+            "早啊宝宝 刚醒吗 赖床去吧",
+        )
+
+    def test_newline_between(self):
+        src = "早啊宝宝 刚醒吗 赖床去吧\n早啊宝宝 刚醒吗 赖床去吧"
+        self.assertEqual(
+            collapse_duplicated_text(src),
+            "早啊宝宝 刚醒吗 赖床去吧",
+        )
+
+    def test_quad_repeat_folds_to_one(self):
+        unit = "早啊宝宝 刚醒吗 赖床去吧"
+        src = unit + unit + unit + unit
+        self.assertEqual(collapse_duplicated_text(src), unit)
+
+    def test_short_not_folded(self):
+        self.assertEqual(collapse_duplicated_text("哈哈哈哈"), "哈哈哈哈")
+
+    def test_not_duplicate_kept(self):
+        src = "早啊宝宝 刚醒吗 赖床去吧 今天天气不错哦"
+        self.assertEqual(collapse_duplicated_text(src), src)
+
+    def test_almost_dup_different_tail_kept(self):
+        src = "早啊宝宝 刚醒吗 赖床去吧早啊宝宝 刚醒吗 赖床去吧呀"
+        self.assertEqual(collapse_duplicated_text(src), src)
+
+
 class TestCleanReply(unittest.TestCase):
     def test_both(self):
         src = "🤔 思考: xx\n\n────\n<think>t</think>你好"
@@ -242,6 +275,10 @@ class TestCleanReply(unittest.TestCase):
 
     def test_only_eos_becomes_empty(self):
         self.assertEqual(clean_reply_text("<|eos|>"), "")
+
+    def test_dup_after_eos_strip(self):
+        src = "早啊宝宝 刚醒吗 赖床去吧<|eos|>早啊宝宝 刚醒吗 赖床去吧"
+        self.assertEqual(clean_reply_text(src), "早啊宝宝 刚醒吗 赖床去吧")
 
 
 class TestPluginHooks(unittest.TestCase):
@@ -272,6 +309,14 @@ class TestPluginHooks(unittest.TestCase):
         event = FakeEvent(chain=[Plain("对外正文<|eos|>")])
         _run(self.plugin.on_decorating_result(event))
         self.assertEqual(event.get_result().chain[0].text, "对外正文")
+
+    def test_collapses_duplicated_completion(self):
+        event = FakeEvent()
+        resp = LLMResponse(
+            completion_text="早啊宝宝 刚醒吗 赖床去吧早啊宝宝 刚醒吗 赖床去吧"
+        )
+        _run(self.plugin.on_llm_response(event, resp))
+        self.assertEqual(resp.completion_text, "早啊宝宝 刚醒吗 赖床去吧")
 
     def test_decorating_drops_injected_plain(self):
         chain = [

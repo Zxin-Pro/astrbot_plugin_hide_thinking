@@ -22,5 +22,11 @@
     "type": "bool",
     "hint": "删除漏进正文的 <|eos|>、<|im_end|>、</s> 等模型结束符。",
     "default": true
+  },
+  "collapse_duplicate": {
+    "description": "折叠整段复读",
+    "type": "bool",
+    "hint": "同一句话被粘两遍时只留一句。例如「早啊宝宝……早啊宝宝……」→ 只发一遍。",
+    "default": true
   }
 }
