@@ -59,6 +59,24 @@ def _install_stubs() -> None:
 
             return deco
 
+        @staticmethod
+        def after_message_sent(priority=0):
+            def deco(fn):
+                fn._priority = priority
+                fn._hook = "after_message_sent"
+                return fn
+
+            return deco
+
+        @staticmethod
+        def on_llm_request(priority=0):
+            def deco(fn):
+                fn._priority = priority
+                fn._hook = "on_llm_request"
+                return fn
+
+            return deco
+
     class AstrMessageEvent:
         async def send(self, message):
             return None
@@ -584,7 +602,10 @@ class TestPluginHooks(unittest.TestCase):
             return "ok"
 
         setattr(AstrMessageEvent, "send", orig_send)
-        plugin = HideThinking(context=None, config={"enabled": True, "dedup_window": 0.05})
+        plugin = HideThinking(
+            context=None,
+            config={"enabled": True, "dedup_window": 0.05, "dedup_prefer": "spaced"},
+        )
         try:
             _run(plugin.initialize())
             event = FakeEvent(umo="g9")
@@ -624,6 +645,71 @@ class TestPluginHooks(unittest.TestCase):
             _run(AstrMessageEvent.send(event, SimpleNamespace(chain=[Plain("喏 可爱的给你 别得寸进尺啊宝宝")])))
             self.assertEqual(captured, [])
             _run(asyncio.sleep(0.15))
+            self.assertEqual(captured, ["喏 可爱的给你 别得寸进尺啊宝宝"])
+        finally:
+            _run(plugin.terminate())
+
+    def test_prefer_second_keeps_later_copy(self):
+        captured = []
+
+        async def orig_send(self, message, *a, **k):
+            captured.append(message.chain[0].text if message.chain else "")
+            return "ok"
+
+        setattr(AstrMessageEvent, "send", orig_send)
+        plugin = HideThinking(
+            context=None,
+            config={"enabled": True, "dedup_window": 0.05, "dedup_prefer": "second"},
+        )
+        try:
+            _run(plugin.initialize())
+            event = FakeEvent(umo="g16")
+            spaced_first = SimpleNamespace(
+                chain=[Plain("37块了啊 额度不是我能充的 你自己看着办 我又不能变钱出来")]
+            )
+            spaceless_second = SimpleNamespace(
+                chain=[Plain("37块了啊额度不是我能充的你自己看着办我又不能变钱出来")]
+            )
+            _run(AstrMessageEvent.send(event, spaced_first))
+            _run(AstrMessageEvent.send(event, spaceless_second))
+            self.assertEqual(captured, ["37块了啊额度不是我能充的你自己看着办我又不能变钱出来"])
+        finally:
+            _run(plugin.terminate())
+
+    def test_after_message_sent_flushes_pending(self):
+        captured = []
+
+        async def orig_send(self, message, *a, **k):
+            captured.append(message.chain[0].text if message.chain else "")
+            return "ok"
+
+        setattr(AstrMessageEvent, "send", orig_send)
+        plugin = HideThinking(context=None, config={"enabled": True, "dedup_window": 30})
+        try:
+            _run(plugin.initialize())
+            event = FakeEvent(umo="g17")
+            _run(AstrMessageEvent.send(event, SimpleNamespace(chain=[Plain("喏 可爱的给你 别得寸进尺啊宝宝")])))
+            self.assertEqual(captured, [])
+            _run(plugin.on_after_message_sent(event))
+            self.assertEqual(captured, ["喏 可爱的给你 别得寸进尺啊宝宝"])
+        finally:
+            _run(plugin.terminate())
+
+    def test_on_llm_request_flushes_pending(self):
+        captured = []
+
+        async def orig_send(self, message, *a, **k):
+            captured.append(message.chain[0].text if message.chain else "")
+            return "ok"
+
+        setattr(AstrMessageEvent, "send", orig_send)
+        plugin = HideThinking(context=None, config={"enabled": True, "dedup_window": 30})
+        try:
+            _run(plugin.initialize())
+            event = FakeEvent(umo="g18")
+            _run(AstrMessageEvent.send(event, SimpleNamespace(chain=[Plain("喏 可爱的给你 别得寸进尺啊宝宝")])))
+            self.assertEqual(captured, [])
+            _run(plugin.on_llm_request(event, None))
             self.assertEqual(captured, ["喏 可爱的给你 别得寸进尺啊宝宝"])
         finally:
             _run(plugin.terminate())

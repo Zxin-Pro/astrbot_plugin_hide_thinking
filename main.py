@@ -357,7 +357,7 @@ def _is_lark_reasoning_comp(comp: Any) -> bool:
     "astrbot_plugin_hide_thinking",
     "Zxin-Pro",
     "隐藏思考/结束符/工具调用泄漏，并折叠整段复读",
-    "1.8.0",
+    "1.9.0",
     "https://github.com/Zxin-Pro/astrbot_plugin_hide_thinking",
 )
 class HideThinking(Star):
@@ -369,9 +369,9 @@ class HideThinking(Star):
         self._recent: dict[str, list[tuple[float, str]]] = {}
         self._pending: dict[str, tuple[Any, Any, Any, Any]] = {}
         try:
-            self._dedup_window = max(0.0, float(self.config.get("dedup_window", 2)))
+            self._dedup_window = max(0.0, float(self.config.get("dedup_window", 6)))
         except Exception:
-            self._dedup_window = 2.0
+            self._dedup_window = 6.0
 
     async def initialize(self):
         try:
@@ -404,6 +404,12 @@ class HideThinking(Star):
 
     def _collapse_duplicate(self) -> bool:
         return _to_bool(self.config.get("collapse_duplicate", True), True)
+
+    def _dedup_prefer(self) -> str:
+        prefer = str(self.config.get("dedup_prefer", "second") or "second").strip().lower()
+        if prefer not in {"second", "first", "spaced"}:
+            prefer = "second"
+        return prefer
 
     def _strip_tool_call(self) -> bool:
         return _to_bool(self.config.get("strip_tool_call", True), True)
@@ -560,7 +566,12 @@ class HideThinking(Star):
             p_text = self._plain_text_of(p_msg)
             i_text = self._plain_text_of(message)
             if p_text and _compact(p_text) == _compact(i_text):
-                if _ws_count(i_text) > _ws_count(p_text):
+                prefer = self._dedup_prefer()
+                if prefer == "second":
+                    await self._flush_pending_message(sid, flush, message)
+                elif prefer == "first":
+                    await self._flush_pending_message(sid, p_flush, p_msg)
+                elif _ws_count(i_text) > _ws_count(p_text):
                     await self._flush_pending_message(sid, flush, message)
                 else:
                     await self._flush_pending_message(sid, p_flush, p_msg)
@@ -724,6 +735,30 @@ class HideThinking(Star):
             except Exception:
                 continue
         self._patched.clear()
+
+    @filter.on_llm_request(priority=-100)
+    async def on_llm_request(self, event: AstrMessageEvent, req: Any):
+        """新一轮流式开始：把上一轮遗留的缓冲立刻发出去。"""
+        if not self._enabled():
+            return
+        try:
+            sid = self._session_key(event)
+            if sid in self._pending:
+                await self._flush_sid(sid)
+        except Exception:
+            logger.error("[HideThinking] 冲刷上轮缓冲失败", exc_info=True)
+
+    @filter.after_message_sent(priority=-100)
+    async def on_after_message_sent(self, event: AstrMessageEvent):
+        """本轮消息都发完了：把还挂着的缓冲立刻发出去，避免整轮延迟。"""
+        if not self._enabled():
+            return
+        try:
+            sid = self._session_key(event)
+            if sid in self._pending:
+                await self._flush_sid(sid)
+        except Exception:
+            logger.error("[HideThinking] 冲刷缓冲失败", exc_info=True)
 
     @filter.on_llm_response(priority=-100)
     async def on_llm_response(self, event: AstrMessageEvent, resp: LLMResponse):

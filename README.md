@@ -36,7 +36,8 @@ Grok / DeepSeek 等模型还会在正文里塞 `<think>…</think>`，以及漏�
 | strip_special | true | 删 `<|eos|>` 等结束符 |
 | collapse_duplicate | true | 整段复读只留一句，跨条尾巴重复也剪（忽略空格） |
 | strip_tool_call | true | 抽出工具调用里的人话，丢掉 XML 外壳 |
-| dedup_window | 2 | 去重等待窗口（秒）：合并同句不同空格的重复发送（含工具调用与正文双发）；0 关闭缓冲。建议大于分段回复的间隔秒数 |
+| dedup_window | 6 | 去重等待窗口（秒）：合并同句不同写法的重复发送；正常回复在本轮发送结束时立刻冲刷，不被拖慢；0 关闭缓冲 |
+| dedup_prefer | second | 同句重复时保留哪条：second=第二遍（默认，留正文空格版）/ first=第一遍 / spaced=空格更多的那条 |
 
 ## 为什么会发两遍
 
