@@ -167,8 +167,11 @@ class FakeEvent:
         return self._result
 
 
+_LOOP = asyncio.new_event_loop()
+
+
 def _run(coro):
-    return asyncio.new_event_loop().run_until_complete(coro)
+    return _LOOP.run_until_complete(coro)
 
 
 class TestStripThinkTags(unittest.TestCase):
@@ -371,7 +374,7 @@ class TestExtractToolCall(unittest.TestCase):
 
 class TestPluginHooks(unittest.TestCase):
     def setUp(self):
-        self.plugin = HideThinking(context=None, config={"enabled": True})
+        self.plugin = HideThinking(context=None, config={"enabled": True, "dedup_window": 0})
 
     def test_clears_extra_and_resp(self):
         event = FakeEvent(extra={"_llm_reasoning_content": "秘密思考"})
@@ -414,7 +417,7 @@ class TestPluginHooks(unittest.TestCase):
             return "ok"
 
         setattr(AstrMessageEvent, "send", orig_send)
-        plugin = HideThinking(context=None, config={"enabled": True})
+        plugin = HideThinking(context=None, config={"enabled": True, "dedup_window": 0})
         try:
             _run(plugin.initialize())
             msg = SimpleNamespace(chain=[Plain("行不行啊<|eos|>")])
@@ -432,7 +435,7 @@ class TestPluginHooks(unittest.TestCase):
             return "ok"
 
         setattr(AstrMessageEvent, "send", orig_send)
-        plugin = HideThinking(context=None, config={"enabled": True})
+        plugin = HideThinking(context=None, config={"enabled": True, "dedup_window": 0})
         try:
             _run(plugin.initialize())
             msg = SimpleNamespace(chain=[Plain("<|eos|>")])
@@ -450,7 +453,7 @@ class TestPluginHooks(unittest.TestCase):
             return "ok"
 
         setattr(AstrMessageEvent, "send", orig_send)
-        plugin = HideThinking(context=None, config={"enabled": True})
+        plugin = HideThinking(context=None, config={"enabled": True, "dedup_window": 0})
         try:
             _run(plugin.initialize())
             event = FakeEvent(umo="g1")
@@ -475,7 +478,7 @@ class TestPluginHooks(unittest.TestCase):
             return "ok"
 
         setattr(AstrMessageEvent, "send", orig_send)
-        plugin = HideThinking(context=None, config={"enabled": True})
+        plugin = HideThinking(context=None, config={"enabled": True, "dedup_window": 0})
         try:
             _run(plugin.initialize())
             event = FakeEvent(umo="g2")
@@ -510,7 +513,7 @@ class TestPluginHooks(unittest.TestCase):
             return "ok"
 
         setattr(AstrMessageEvent, "send", orig_send)
-        plugin = HideThinking(context=None, config={"enabled": True})
+        plugin = HideThinking(context=None, config={"enabled": True, "dedup_window": 0})
         try:
             _run(plugin.initialize())
             event = FakeEvent(umo="g3")
@@ -541,7 +544,7 @@ class TestPluginHooks(unittest.TestCase):
             return "ok"
 
         setattr(AstrMessageEvent, "send_streaming", orig_stream)
-        plugin = HideThinking(context=None, config={"enabled": True})
+        plugin = HideThinking(context=None, config={"enabled": True, "dedup_window": 0})
         try:
             _run(plugin.initialize())
 
@@ -551,6 +554,80 @@ class TestPluginHooks(unittest.TestCase):
             result = _run(AstrMessageEvent().send_streaming(gen()))
             self.assertEqual(captured, ["撑住再来"])
             self.assertEqual(result, "ok")
+        finally:
+            _run(plugin.terminate())
+
+    def test_buffer_prefers_spaced_variant(self):
+        captured = []
+
+        async def orig_send(self, message, *a, **k):
+            captured.append(message.chain[0].text if message.chain else "")
+            return "ok"
+
+        setattr(AstrMessageEvent, "send", orig_send)
+        plugin = HideThinking(context=None, config={"enabled": True, "dedup_window": 0.05})
+        try:
+            _run(plugin.initialize())
+            event = FakeEvent(umo="g9")
+            spaceless = SimpleNamespace(
+                chain=[Plain("37块了啊额度不是我能充的你自己看着办我又不能变钱出来")]
+            )
+            spaced = SimpleNamespace(
+                chain=[Plain("37块了啊 额度不是我能充的 你自己看着办 我又不能变钱出来")]
+            )
+            _run(AstrMessageEvent.send(event, spaceless))
+            self.assertEqual(captured, [])
+            _run(AstrMessageEvent.send(event, spaced))
+            self.assertEqual(
+                captured,
+                ["37块了啊 额度不是我能充的 你自己看着办 我又不能变钱出来"],
+            )
+            _run(asyncio.sleep(0.15))
+            self.assertEqual(
+                captured,
+                ["37块了啊 额度不是我能充的 你自己看着办 我又不能变钱出来"],
+            )
+        finally:
+            _run(plugin.terminate())
+
+    def test_buffer_flushes_single_after_window(self):
+        captured = []
+
+        async def orig_send(self, message, *a, **k):
+            captured.append(message.chain[0].text if message.chain else "")
+            return "ok"
+
+        setattr(AstrMessageEvent, "send", orig_send)
+        plugin = HideThinking(context=None, config={"enabled": True, "dedup_window": 0.05})
+        try:
+            _run(plugin.initialize())
+            event = FakeEvent(umo="g10")
+            _run(AstrMessageEvent.send(event, SimpleNamespace(chain=[Plain("喏 可爱的给你 别得寸进尺啊宝宝")])))
+            self.assertEqual(captured, [])
+            _run(asyncio.sleep(0.15))
+            self.assertEqual(captured, ["喏 可爱的给你 别得寸进尺啊宝宝"])
+        finally:
+            _run(plugin.terminate())
+
+    def test_buffer_keeps_order_for_distinct(self):
+        captured = []
+
+        async def orig_send(self, message, *a, **k):
+            captured.append(message.chain[0].text if message.chain else "")
+            return "ok"
+
+        setattr(AstrMessageEvent, "send", orig_send)
+        plugin = HideThinking(context=None, config={"enabled": True, "dedup_window": 0.05})
+        try:
+            _run(plugin.initialize())
+            event = FakeEvent(umo="g11")
+            texts = ["第一条 哈喽", "第二条 嗯嗯", "第三条 好的"]
+            for t in texts:
+                _run(AstrMessageEvent.send(event, SimpleNamespace(chain=[Plain(t)])))
+            # 前两条已被冲刷，最后一条等窗口
+            self.assertEqual(captured, ["第一条 哈喽", "第二条 嗯嗯"])
+            _run(asyncio.sleep(0.15))
+            self.assertEqual(captured, texts)
         finally:
             _run(plugin.terminate())
 

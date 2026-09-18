@@ -34,5 +34,11 @@
     "type": "bool",
     "hint": "模型把 <tool_call> / send_message_to_user 当正文发出时，抽出里面的人话，外壳丢掉。",
     "default": true
+  },
+  "dedup_window": {
+    "description": "跨条去重等待窗口（秒）",
+    "type": "int",
+    "hint": "同一句话两种空格写法先后到达时，只发空格更自然的那条；0 关闭缓冲立即发送。建议大于分段回复的间隔秒数。",
+    "default": 2
   }
 }

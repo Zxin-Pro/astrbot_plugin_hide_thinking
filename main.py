@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import time
@@ -240,6 +241,30 @@ def _compact(text: str) -> str:
     return re.sub(r"\s+", "", text or "")
 
 
+def _ws_count(text: str) -> int:
+    return sum(1 for ch in text or "" if ch.isspace())
+
+
+def dedupe_lines_compact(text: str) -> str:
+    """同一段文本里出现只差空格的重复行时，留空格更自然的那条。"""
+    if not text or "\n" not in text:
+        return text
+    out: list[str] = []
+    index: dict[str, int] = {}
+    for line in text.splitlines():
+        c = _compact(line)
+        if not c:
+            out.append(line)
+            continue
+        idx = index.get(c)
+        if idx is None:
+            index[c] = len(out)
+            out.append(line)
+        elif _ws_count(line) > _ws_count(out[idx]):
+            out[idx] = line
+    return "\n".join(out)
+
+
 def _prefix_until_compact(text: str, keep_compact: str) -> str:
     """截到 compact 前缀刚好等于 keep_compact 的最短原文前缀。"""
     if not keep_compact:
@@ -305,6 +330,7 @@ def clean_reply_text(
     if strip_special:
         text = strip_special_tokens(text)
     if collapse_duplicate:
+        text = dedupe_lines_compact(text)
         text = collapse_duplicated_text(text)
     return tidy_text(text)
 
@@ -326,7 +352,7 @@ def _is_lark_reasoning_comp(comp: Any) -> bool:
     "astrbot_plugin_hide_thinking",
     "Zxin-Pro",
     "隐藏思考/结束符/工具调用泄漏，并折叠整段复读",
-    "1.6.0",
+    "1.7.0",
     "https://github.com/Zxin-Pro/astrbot_plugin_hide_thinking",
 )
 class HideThinking(Star):
@@ -336,6 +362,11 @@ class HideThinking(Star):
         self._patched: list[tuple[Any, str, Any]] = []
         self._patching = False
         self._recent: dict[str, list[tuple[float, str]]] = {}
+        self._pending: dict[str, tuple[Any, Any, Any, Any]] = {}
+        try:
+            self._dedup_window = max(0.0, float(self.config.get("dedup_window", 2)))
+        except Exception:
+            self._dedup_window = 2.0
 
     async def initialize(self):
         try:
@@ -344,6 +375,11 @@ class HideThinking(Star):
             logger.error("[HideThinking] 安装 send 补丁失败", exc_info=True)
 
     async def terminate(self):
+        try:
+            for sid in list(self._pending.keys()):
+                await self._flush_sid(sid)
+        except Exception:
+            logger.error("[HideThinking] 终止冲刷缓冲失败", exc_info=True)
         try:
             self._remove_send_patch()
         except Exception:
@@ -473,6 +509,64 @@ class HideThinking(Star):
             return message
         return message
 
+    @staticmethod
+    def _is_pure_plain(message: Any) -> bool:
+        chain = getattr(message, "chain", None)
+        if not chain:
+            return False
+        return all(isinstance(c, Plain) for c in chain)
+
+    @staticmethod
+    def _plain_text_of(message: Any) -> str:
+        chain = getattr(message, "chain", None) or []
+        return "".join(
+            c.text for c in chain if isinstance(c, Plain) and c.text is not None
+        )
+
+    async def _do_send(self, sid: str, orig: Any, event: Any, message: Any) -> None:
+        chain = getattr(message, "chain", None)
+        if chain is not None:
+            chain = self._apply_recent(event, list(chain))
+            if not chain:
+                return
+            try:
+                message.chain = chain
+            except Exception:
+                pass
+        await orig(event, message)
+
+    async def _flush_sid(self, sid: str) -> None:
+        item = self._pending.pop(sid, None)
+        if not item:
+            return
+        orig, event, message, task = item
+        if task is not None:
+            task.cancel()
+        await self._do_send(sid, orig, event, message)
+
+    async def _buffer_send(self, sid: str, orig: Any, event: Any, message: Any) -> None:
+        item = self._pending.pop(sid, None)
+        if item is not None:
+            p_orig, p_event, p_msg, p_task = item
+            if p_task is not None:
+                p_task.cancel()
+            p_text = self._plain_text_of(p_msg)
+            i_text = self._plain_text_of(message)
+            if p_text and _compact(p_text) == _compact(i_text):
+                if _ws_count(i_text) > _ws_count(p_text):
+                    await self._do_send(sid, orig, event, message)
+                else:
+                    await self._do_send(sid, p_orig, p_event, p_msg)
+                return
+            await self._do_send(sid, p_orig, p_event, p_msg)
+
+        async def _later() -> None:
+            await asyncio.sleep(self._dedup_window)
+            await self._flush_sid(sid)
+
+        task = asyncio.create_task(_later())
+        self._pending[sid] = (orig, event, message, task)
+
     def _iter_event_classes(self):
         seen: set[int] = set()
         stack = [AstrMessageEvent]
@@ -507,7 +601,7 @@ class HideThinking(Star):
                 if plugin._enabled() and not plugin._patching:
                     plugin._patching = True
                     try:
-                        message = plugin._scrub_message(message, event)
+                        message = plugin._scrub_message(message)
                         chain = getattr(message, "chain", None)
                         if chain is not None and len(chain) == 0:
                             return None
@@ -515,6 +609,24 @@ class HideThinking(Star):
                         logger.error("[HideThinking] send 清洗失败", exc_info=True)
                     finally:
                         plugin._patching = False
+                    if (
+                        plugin._dedup_window > 0
+                        and plugin._collapse_duplicate()
+                        and plugin._is_pure_plain(message)
+                    ):
+                        await plugin._buffer_send(
+                            plugin._session_key(event), orig, event, message
+                        )
+                        return None
+                    try:
+                        chain = getattr(message, "chain", None)
+                        if chain is not None:
+                            chain = plugin._apply_recent(event, list(chain))
+                            if not chain:
+                                return None
+                            message.chain = chain
+                    except Exception:
+                        logger.error("[HideThinking] send 去重失败", exc_info=True)
                 return await orig(event, message, *args, **kwargs)
 
             return patched_send

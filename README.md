@@ -36,6 +36,7 @@ Grok / DeepSeek 等模型还会在正文里塞 `<think>…</think>`，以及漏�
 | strip_special | true | 删 `<|eos|>` 等结束符 |
 | collapse_duplicate | true | 整段复读只留一句，跨条尾巴重复也剪（忽略空格） |
 | strip_tool_call | true | 抽出工具调用里的人话，丢掉 XML 外壳 |
+| dedup_window | 2 | 去重等待窗口（秒）：同一句话两种空格写法先后到达时，只发空格更自然的那条；0 关闭缓冲。建议大于分段回复的间隔秒数 |
 
 ## 安装
 
@@ -49,4 +50,5 @@ https://github.com/Zxin-Pro/astrbot_plugin_hide_thinking
 
 - 非流式（AstrBot 默认）即可挡住 QQ 里的思考
 - 流式 / 插件直发也会在真正 send 前再剥一层结束符和思考标签
+- 开启去重窗口后，纯文本消息会缓冲最多 N 秒再发（等待可能更自然的空格版本），最后一条回复略有延迟
 - 飞书折叠思考卡片一并丢掉
