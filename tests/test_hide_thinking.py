@@ -141,6 +141,7 @@ from main import (  # noqa: E402
     HideThinking,
     clean_reply_text,
     collapse_duplicated_text,
+    extract_tool_call_text,
     strip_injected_reasoning,
     strip_recent_overlap,
     strip_special_tokens,
@@ -324,6 +325,49 @@ class TestCleanReply(unittest.TestCase):
         src = "早啊宝宝 刚醒吗 赖床去吧<|eos|>早啊宝宝 刚醒吗 赖床去吧"
         self.assertEqual(clean_reply_text(src), "早啊宝宝 刚醒吗 赖床去吧")
 
+    def test_tool_call_extracts_plain(self):
+        src = (
+            '<tool_call>\nsend_message_to_user\n<parameter>messages>'
+            '[{"type": "plain", "text": "又被拦了 黑丝出不来 换词再说"}]'
+            "</parameter>\n</tool_call>"
+        )
+        self.assertEqual(clean_reply_text(src), "又被拦了 黑丝出不来 换词再说")
+
+
+class TestExtractToolCall(unittest.TestCase):
+    def test_full_block(self):
+        src = (
+            '<tool_call>\nsend_message_to_user\n<parameter>messages>'
+            '[{"type": "plain", "text": "又被拦了 黑丝出不来 换词再说"}]'
+            "</parameter>\n</tool_call>"
+        )
+        self.assertEqual(
+            extract_tool_call_text(src),
+            "又被拦了 黑丝出不来 换词再说",
+        )
+
+    def test_scaffold_open(self):
+        self.assertEqual(extract_tool_call_text("<tool_call>"), "")
+
+    def test_scaffold_name(self):
+        self.assertEqual(extract_tool_call_text("send_message_to_user"), "")
+
+    def test_scaffold_param(self):
+        self.assertEqual(extract_tool_call_text("<parameter>messages>"), "")
+
+    def test_scaffold_close_param(self):
+        self.assertEqual(extract_tool_call_text("</parameter>"), "")
+
+    def test_scaffold_close_tool(self):
+        self.assertEqual(extract_tool_call_text("</tool_call>"), "")
+
+    def test_json_payload_only(self):
+        src = '[{"type": "plain", "text": "又被拦了 黑丝出不来 换词再说"}]'
+        self.assertEqual(extract_tool_call_text(src), "又被拦了 黑丝出不来 换词再说")
+
+    def test_normal_kept(self):
+        self.assertEqual(extract_tool_call_text("今天天气不错"), "今天天气不错")
+
 
 class TestPluginHooks(unittest.TestCase):
     def setUp(self):
@@ -455,6 +499,36 @@ class TestPluginHooks(unittest.TestCase):
                     "想得美我又没钱包自己去打工37块还不够你饿着吗",
                 ],
             )
+        finally:
+            _run(plugin.terminate())
+
+    def test_send_patch_strips_split_tool_call(self):
+        captured = []
+
+        async def orig_send(self, message, *a, **k):
+            captured.append(message.chain[0].text if message.chain else "")
+            return "ok"
+
+        setattr(AstrMessageEvent, "send", orig_send)
+        plugin = HideThinking(context=None, config={"enabled": True})
+        try:
+            _run(plugin.initialize())
+            event = FakeEvent(umo="g3")
+            parts = [
+                "<tool_call>",
+                "send_message_to_user",
+                "<parameter>messages>",
+                '[{"type": "plain", "text": "又被拦了 黑丝出不来 换词再说"}]',
+                "</parameter>",
+                "</tool_call>",
+            ]
+            results = []
+            for p in parts:
+                results.append(
+                    _run(AstrMessageEvent.send(event, SimpleNamespace(chain=[Plain(p)])))
+                )
+            self.assertEqual(captured, ["又被拦了 黑丝出不来 换词再说"])
+            self.assertEqual(results.count(None), 5)
         finally:
             _run(plugin.terminate())
 

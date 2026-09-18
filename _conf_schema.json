@@ -28,5 +28,11 @@
     "type": "bool",
     "hint": "同一句话被粘两遍时只留一句；分段发出后，后一条把前一条接在尾巴上也会剪掉。",
     "default": true
+  },
+  "strip_tool_call": {
+    "description": "删除泄漏的工具调用",
+    "type": "bool",
+    "hint": "模型把 <tool_call> / send_message_to_user 当正文发出时，抽出里面的人话，外壳丢掉。",
+    "default": true
   }
 }

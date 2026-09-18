@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 import time
 from typing import Any
@@ -59,6 +60,25 @@ _MIN_DUP_UNIT = 8
 _RECENT_TTL = 60.0
 _RECENT_MAX = 8
 
+# 模型把工具调用当正文吐出来：<tool_call>…</tool_call>
+_TOOL_BLOCK = re.compile(
+    r"<\s*(tool_call|function_call|invoke)\s*>([\s\S]*?)</\s*\1\s*>",
+    re.IGNORECASE,
+)
+_TOOL_UNCLOSED = re.compile(
+    r"<\s*(?:tool_call|function_call|invoke)\s*>[\s\S]*$",
+    re.IGNORECASE,
+)
+_TOOL_SCAFFOLD = re.compile(
+    r"^\s*(?:"
+    r"</?\s*(?:tool_call|function_call|invoke)\s*>"
+    r"|</?\s*parameter(?:\s*>[^<\n]*)?>"
+    r"|<\s*parameter\s*>[^<\n]*>"
+    r"|send_message_to_user"
+    r")\s*$",
+    re.IGNORECASE,
+)
+
 
 def _is_think_tag(name: str) -> bool:
     return name.lower() in _THINK_TAG_NAMES or name in _THINK_TAG_NAMES
@@ -110,6 +130,77 @@ def strip_special_tokens(text: str) -> str:
     if not text:
         return text
     return _SPECIAL_TOKEN.sub("", text)
+
+
+def _extract_plain_from_obj(obj: Any) -> str:
+    if isinstance(obj, str):
+        s = obj.strip()
+        if s.startswith("{") or s.startswith("["):
+            try:
+                return _extract_plain_from_obj(json.loads(s))
+            except Exception:
+                return s
+        return s
+    if isinstance(obj, dict):
+        if obj.get("type") == "plain" and obj.get("text"):
+            return str(obj.get("text") or "").strip()
+        for key in ("text", "content", "message", "messages"):
+            if key in obj:
+                got = _extract_plain_from_obj(obj[key])
+                if got:
+                    return got
+        return ""
+    if isinstance(obj, list):
+        parts = [_extract_plain_from_obj(item) for item in obj]
+        return "\n".join(p for p in parts if p)
+    return ""
+
+
+_JSON_BLOB = re.compile(r"(\[[\s\S]*\]|\{[\s\S]*\})")
+
+
+def _plain_from_tool_inner(inner: str) -> str:
+    inner = (inner or "").strip()
+    if not inner:
+        return ""
+    blob = _JSON_BLOB.search(inner)
+    if blob:
+        got = _extract_plain_from_obj(blob.group(1))
+        if got:
+            return got
+    got = _extract_plain_from_obj(inner)
+    if got and got != inner:
+        return got
+    return ""
+
+
+def extract_tool_call_text(text: str) -> str:
+    """整段 <tool_call> 里抽出人话；分段发出的外壳碎片丢掉。"""
+    t = (text or "").strip()
+    if not t:
+        return t
+    if _TOOL_SCAFFOLD.match(t):
+        return ""
+
+    def _replace_block(match: re.Match) -> str:
+        return _plain_from_tool_inner(match.group(2))
+
+    t = _TOOL_BLOCK.sub(_replace_block, t)
+    t = _TOOL_UNCLOSED.sub("", t)
+    t = t.strip()
+    if _TOOL_SCAFFOLD.match(t):
+        return ""
+    if t.startswith("[") or t.startswith("{"):
+        extracted = _extract_plain_from_obj(t)
+        if extracted:
+            return extracted
+    lower = t.lower()
+    if "<parameter" in lower or "send_message_to_user" in lower or "<tool_call" in lower:
+        got = _plain_from_tool_inner(t)
+        if got:
+            return got
+        return ""
+    return t
 
 
 def tidy_text(text: str) -> str:
@@ -201,11 +292,14 @@ def clean_reply_text(
     strip_injected: bool = True,
     strip_special: bool = True,
     collapse_duplicate: bool = True,
+    strip_tool_call: bool = True,
 ) -> str:
     if not text:
         return text
     if strip_injected:
         text = strip_injected_reasoning(text)
+    if strip_tool_call:
+        text = extract_tool_call_text(text)
     if strip_tags:
         text = strip_think_tags(text)
     if strip_special:
@@ -231,8 +325,8 @@ def _is_lark_reasoning_comp(comp: Any) -> bool:
 @register(
     "astrbot_plugin_hide_thinking",
     "Zxin-Pro",
-    "隐藏思考/结束符，并折叠整段复读",
-    "1.5.0",
+    "隐藏思考/结束符/工具调用泄漏，并折叠整段复读",
+    "1.6.0",
     "https://github.com/Zxin-Pro/astrbot_plugin_hide_thinking",
 )
 class HideThinking(Star):
@@ -269,6 +363,9 @@ class HideThinking(Star):
 
     def _collapse_duplicate(self) -> bool:
         return _to_bool(self.config.get("collapse_duplicate", True), True)
+
+    def _strip_tool_call(self) -> bool:
+        return _to_bool(self.config.get("strip_tool_call", True), True)
 
     def _session_key(self, event: Any) -> str:
         getter = getattr(event, "unified_msg_origin", None)
@@ -337,6 +434,7 @@ class HideThinking(Star):
             strip_injected=self._strip_injected(),
             strip_special=self._strip_special(),
             collapse_duplicate=self._collapse_duplicate(),
+            strip_tool_call=self._strip_tool_call(),
         )
 
     def _clear_reasoning(self, event: AstrMessageEvent, resp: LLMResponse | None) -> None:
