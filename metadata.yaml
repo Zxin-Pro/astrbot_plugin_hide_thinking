@@ -1,5 +1,5 @@
 name: astrbot_plugin_hide_thinking
-desc: 隐藏模型思考内容，QQ 只发正文
-version: v1.0.0
+desc: 隐藏模型思考内容和结束符，QQ 只发正文
+version: v1.1.0
 author: Zxin-Pro
 repo: https://github.com/Zxin-Pro/astrbot_plugin_hide_thinking

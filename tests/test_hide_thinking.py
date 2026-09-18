@@ -125,6 +125,7 @@ from main import (  # noqa: E402
     HideThinking,
     clean_reply_text,
     strip_injected_reasoning,
+    strip_special_tokens,
     strip_think_tags,
 )
 
@@ -202,6 +203,30 @@ class TestStripInjected(unittest.TestCase):
         self.assertEqual(strip_injected_reasoning(src), src)
 
 
+class TestStripSpecial(unittest.TestCase):
+    def test_eos_token(self):
+        self.assertEqual(strip_special_tokens("你好<|eos|>"), "你好")
+
+    def test_repeated_eos(self):
+        self.assertEqual(strip_special_tokens("你好<|eos|><|eos|>"), "你好")
+
+    def test_im_end(self):
+        self.assertEqual(strip_special_tokens("正文<|im_end|>"), "正文")
+
+    def test_im_start_kept_stripped(self):
+        self.assertEqual(strip_special_tokens("<|im_start|>user\n嗨"), "user\n嗨")
+
+    def test_llama_s(self):
+        self.assertEqual(strip_special_tokens("完</s>"), "完")
+
+    def test_bracket_eos(self):
+        self.assertEqual(strip_special_tokens("完[EOS]"), "完")
+
+    def test_plain_angle_kept(self):
+        src = "比较 a < b 和 c > d"
+        self.assertEqual(strip_special_tokens(src), src)
+
+
 class TestCleanReply(unittest.TestCase):
     def test_both(self):
         src = "🤔 思考: xx\n\n────\n<think>t</think>你好"
@@ -210,6 +235,13 @@ class TestCleanReply(unittest.TestCase):
     def test_only_thinking_becomes_empty(self):
         src = "<think>只有思考</think>"
         self.assertEqual(clean_reply_text(src), "")
+
+    def test_eos_with_think(self):
+        src = "<think>x</think>你好<|eos|>"
+        self.assertEqual(clean_reply_text(src), "你好")
+
+    def test_only_eos_becomes_empty(self):
+        self.assertEqual(clean_reply_text("<|eos|>"), "")
 
 
 class TestPluginHooks(unittest.TestCase):
@@ -229,6 +261,17 @@ class TestPluginHooks(unittest.TestCase):
         resp = LLMResponse(completion_text="<think>x</think>对外说")
         _run(self.plugin.on_llm_response(event, resp))
         self.assertEqual(resp.completion_text, "对外说")
+
+    def test_strips_eos_from_completion(self):
+        event = FakeEvent()
+        resp = LLMResponse(completion_text="对外说<|eos|>")
+        _run(self.plugin.on_llm_response(event, resp))
+        self.assertEqual(resp.completion_text, "对外说")
+
+    def test_decorating_drops_eos_plain(self):
+        event = FakeEvent(chain=[Plain("对外正文<|eos|>")])
+        _run(self.plugin.on_decorating_result(event))
+        self.assertEqual(event.get_result().chain[0].text, "对外正文")
 
     def test_decorating_drops_injected_plain(self):
         chain = [

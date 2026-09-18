@@ -16,5 +16,11 @@
     "type": "bool",
     "hint": "删除回复开头的「🤔 思考:」整段（AstrBot 开启显示思考内容时会拼进去）。",
     "default": true
+  },
+  "strip_special": {
+    "description": "删除结束符",
+    "type": "bool",
+    "hint": "删除漏进正文的 <|eos|>、<|im_end|>、</s> 等模型结束符。",
+    "default": true
   }
 }
