@@ -21,7 +21,7 @@ Grok / DeepSeek 等模型还会在正文里塞 `<think>…</think>`，以及漏�
 2. 删掉 `<think>` / `<thinking>` / `<reasoning>` 等标签及内部内容
 3. 如果思考已经被拼进正文开头（`🤔 思考:`），整段去掉
 4. 删掉漏进正文的结束符：`<|eos|>` `<|im_end|>` `</s>` 等
-5. 同一句话被粘两遍时只留一句；分段发出后，后一条把前一条接在尾巴上也剪掉
+5. 同一句话被粘两遍时只留一句；分段发出后，后一条把前一条接在尾巴上也剪掉（空格不同也算同一句）
 
 不改模型请求，不影响历史里的签名字段。
 
@@ -33,7 +33,7 @@ Grok / DeepSeek 等模型还会在正文里塞 `<think>…</think>`，以及漏�
 | strip_tags | true | 删思维链标签 |
 | strip_injected | true | 删已拼进正文的「🤔 思考:」块 |
 | strip_special | true | 删 `<|eos|>` 等结束符 |
-| collapse_duplicate | true | 整段复读只留一句，跨条尾巴重复也剪 |
+| collapse_duplicate | true | 整段复读只留一句，跨条尾巴重复也剪（忽略空格） |
 
 ## 安装
 

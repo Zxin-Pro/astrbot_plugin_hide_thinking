@@ -144,19 +144,51 @@ def collapse_duplicated_text(text: str) -> str:
     return s.strip()
 
 
+def _compact(text: str) -> str:
+    """去掉空白后再比，避免「有空格 / 没空格」被当成两句。"""
+    return re.sub(r"\s+", "", text or "")
+
+
+def _prefix_until_compact(text: str, keep_compact: str) -> str:
+    """截到 compact 前缀刚好等于 keep_compact 的最短原文前缀。"""
+    if not keep_compact:
+        return ""
+    acc: list[str] = []
+    seen = 0
+    for ch in text:
+        acc.append(ch)
+        if not ch.isspace():
+            seen += 1
+            if seen == len(keep_compact):
+                return "".join(acc).rstrip()
+    return "".join(acc).rstrip()
+
+
 def strip_recent_overlap(text: str, recents: list[str], min_len: int = _MIN_DUP_UNIT) -> str:
-    """后一条把刚发过的句子接在尾巴上时，把尾巴剪掉。"""
+    """后一条是刚发过的句子（可差空格），或把前一句接在尾巴上时，剪掉。"""
     t = (text or "").strip()
     if not t:
         return t
+    t_c = _compact(t)
     for prev in recents:
         p = (prev or "").strip()
-        if len(p) < min_len:
+        p_c = _compact(p)
+        if len(p_c) < min_len:
             continue
-        if t == p:
+        if t_c == p_c:
             return ""
         if t.endswith(p):
             t = t[: -len(p)].rstrip()
+            t_c = _compact(t)
+            if not t:
+                return ""
+            continue
+        if t_c.endswith(p_c):
+            keep_c = t_c[: -len(p_c)]
+            if not keep_c:
+                return ""
+            t = _prefix_until_compact(t, keep_c)
+            t_c = _compact(t)
             if not t:
                 return ""
     return t
@@ -200,7 +232,7 @@ def _is_lark_reasoning_comp(comp: Any) -> bool:
     "astrbot_plugin_hide_thinking",
     "Zxin-Pro",
     "隐藏思考/结束符，并折叠整段复读",
-    "1.4.0",
+    "1.5.0",
     "https://github.com/Zxin-Pro/astrbot_plugin_hide_thinking",
 )
 class HideThinking(Star):

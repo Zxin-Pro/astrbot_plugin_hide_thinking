@@ -293,6 +293,16 @@ class TestRecentOverlap(unittest.TestCase):
         nxt = "今天天气不错哦亲"
         self.assertEqual(strip_recent_overlap(nxt, [prev]), nxt)
 
+    def test_same_after_strip_spaces(self):
+        prev = "37块了啊 额度不是我能充的 你自己看着办 我又不能变钱出来"
+        nxt = "37块了啊额度不是我能充的你自己看着办我又不能变钱出来"
+        self.assertEqual(strip_recent_overlap(nxt, [prev]), "")
+
+    def test_tail_overlap_ignore_spaces(self):
+        prev = "额度不是我能充的 你自己看着办"
+        nxt = "37块了啊额度不是我能充的你自己看着办"
+        self.assertEqual(strip_recent_overlap(nxt, [prev]), "37块了啊")
+
 
 class TestCleanReply(unittest.TestCase):
     def test_both(self):
@@ -409,6 +419,41 @@ class TestPluginHooks(unittest.TestCase):
             self.assertEqual(
                 captured,
                 ["喏 可爱的给你 别得寸进尺啊宝宝", "好 给你找可爱的"],
+            )
+        finally:
+            _run(plugin.terminate())
+
+    def test_send_patch_drops_space_variant(self):
+        captured = []
+
+        async def orig_send(self, message, *a, **k):
+            captured.append(message.chain[0].text if message.chain else "")
+            return "ok"
+
+        setattr(AstrMessageEvent, "send", orig_send)
+        plugin = HideThinking(context=None, config={"enabled": True})
+        try:
+            _run(plugin.initialize())
+            event = FakeEvent(umo="g2")
+            first = SimpleNamespace(
+                chain=[Plain("37块了啊 额度不是我能充的 你自己看着办 我又不能变钱出来")]
+            )
+            second = SimpleNamespace(
+                chain=[Plain("37块了啊额度不是我能充的你自己看着办我又不能变钱出来")]
+            )
+            third = SimpleNamespace(
+                chain=[Plain("想得美我又没钱包自己去打工37块还不够你饿着吗")]
+            )
+            _run(AstrMessageEvent.send(event, first))
+            r2 = _run(AstrMessageEvent.send(event, second))
+            _run(AstrMessageEvent.send(event, third))
+            self.assertIsNone(r2)
+            self.assertEqual(
+                captured,
+                [
+                    "37块了啊 额度不是我能充的 你自己看着办 我又不能变钱出来",
+                    "想得美我又没钱包自己去打工37块还不够你饿着吗",
+                ],
             )
         finally:
             _run(plugin.terminate())
