@@ -46,5 +46,5 @@ https://github.com/Zxin-Pro/astrbot_plugin_hide_thinking
 ## 说明
 
 - 非流式（AstrBot 默认）即可挡住 QQ 里的思考
-- 若同时开了「流式输出」和「显示思考内容」，思考 delta 会直接发出，插件拦不住；把面板里的「显示思考内容」关掉即可
+- 流式 / 插件直发也会在真正 send 前再剥一层结束符和思考标签
 - 飞书折叠思考卡片一并丢掉

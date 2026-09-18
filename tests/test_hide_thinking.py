@@ -59,8 +59,23 @@ def _install_stubs() -> None:
 
             return deco
 
+    class AstrMessageEvent:
+        async def send(self, message):
+            return None
+
+        async def send_streaming(self, generator, use_fallback=False):
+            return None
+
+        @classmethod
+        def __subclasses__(cls):
+            return []
+
+    # 保证 cls.__dict__ 能拿到 send，方便补丁测试覆盖
     event_mod.filter = filter
-    event_mod.AstrMessageEvent = object
+    event_mod.AstrMessageEvent = AstrMessageEvent
+
+    event_mod.filter = filter
+    event_mod.AstrMessageEvent = AstrMessageEvent
 
     class Star:
         def __init__(self, context=None):
@@ -117,6 +132,7 @@ def _install_stubs() -> None:
 
 _install_stubs()
 
+from astrbot.api.event import AstrMessageEvent  # noqa: E402
 from astrbot.api.message_components import Plain  # noqa: E402
 from astrbot.api.provider import LLMResponse  # noqa: E402
 
@@ -317,6 +333,64 @@ class TestPluginHooks(unittest.TestCase):
         )
         _run(self.plugin.on_llm_response(event, resp))
         self.assertEqual(resp.completion_text, "早啊宝宝 刚醒吗 赖床去吧")
+
+    def test_send_patch_strips_eos(self):
+        captured = {}
+
+        async def orig_send(self, message, *a, **k):
+            captured["text"] = message.chain[0].text
+            return "ok"
+
+        setattr(AstrMessageEvent, "send", orig_send)
+        plugin = HideThinking(context=None, config={"enabled": True})
+        try:
+            _run(plugin.initialize())
+            msg = SimpleNamespace(chain=[Plain("行不行啊<|eos|>")])
+            result = _run(AstrMessageEvent().send(msg))
+            self.assertEqual(captured["text"], "行不行啊")
+            self.assertEqual(result, "ok")
+        finally:
+            _run(plugin.terminate())
+
+    def test_send_patch_drops_only_eos(self):
+        called = {"n": 0}
+
+        async def orig_send(self, message, *a, **k):
+            called["n"] += 1
+            return "ok"
+
+        setattr(AstrMessageEvent, "send", orig_send)
+        plugin = HideThinking(context=None, config={"enabled": True})
+        try:
+            _run(plugin.initialize())
+            msg = SimpleNamespace(chain=[Plain("<|eos|>")])
+            result = _run(AstrMessageEvent().send(msg))
+            self.assertIsNone(result)
+            self.assertEqual(called["n"], 0)
+        finally:
+            _run(plugin.terminate())
+
+    def test_send_streaming_patch_strips_eos(self):
+        captured = []
+
+        async def orig_stream(self, generator, *a, **k):
+            async for chain in generator:
+                captured.append(chain.chain[0].text)
+            return "ok"
+
+        setattr(AstrMessageEvent, "send_streaming", orig_stream)
+        plugin = HideThinking(context=None, config={"enabled": True})
+        try:
+            _run(plugin.initialize())
+
+            async def gen():
+                yield SimpleNamespace(chain=[Plain("撑住再来<|eos|>")])
+
+            result = _run(AstrMessageEvent().send_streaming(gen()))
+            self.assertEqual(captured, ["撑住再来"])
+            self.assertEqual(result, "ok")
+        finally:
+            _run(plugin.terminate())
 
     def test_decorating_drops_injected_plain(self):
         chain = [

@@ -178,13 +178,27 @@ def _is_lark_reasoning_comp(comp: Any) -> bool:
     "astrbot_plugin_hide_thinking",
     "Zxin-Pro",
     "隐藏思考/结束符，并折叠整段复读",
-    "1.2.0",
+    "1.3.0",
     "https://github.com/Zxin-Pro/astrbot_plugin_hide_thinking",
 )
 class HideThinking(Star):
     def __init__(self, context: Context, config: dict | None = None):
         super().__init__(context)
         self.config = config if isinstance(config, dict) else {}
+        self._patched: list[tuple[Any, str, Any]] = []
+        self._patching = False
+
+    async def initialize(self):
+        try:
+            self._install_send_patch()
+        except Exception:
+            logger.error("[HideThinking] 安装 send 补丁失败", exc_info=True)
+
+    async def terminate(self):
+        try:
+            self._remove_send_patch()
+        except Exception:
+            logger.error("[HideThinking] 卸载 send 补丁失败", exc_info=True)
 
     def _enabled(self) -> bool:
         return _to_bool(self.config.get("enabled", True), True)
@@ -230,6 +244,100 @@ class HideThinking(Star):
                     comp.text = cleaned
             new_chain.append(comp)
         return new_chain
+
+    def _scrub_message(self, message: Any) -> Any:
+        if not self._enabled() or message is None:
+            return message
+        chain = getattr(message, "chain", None)
+        if chain is None:
+            return message
+        new_chain = self._scrub_chain(list(chain))
+        if new_chain is chain:
+            return message
+        try:
+            message.chain = new_chain
+        except Exception:
+            return message
+        return message
+
+    def _iter_event_classes(self):
+        seen: set[int] = set()
+        stack = [AstrMessageEvent]
+        while stack:
+            cls = stack.pop()
+            cid = id(cls)
+            if cid in seen:
+                continue
+            seen.add(cid)
+            yield cls
+            try:
+                stack.extend(cls.__subclasses__())
+            except Exception:
+                continue
+
+    def _patch_method(self, cls: Any, name: str, factory) -> None:
+        orig = cls.__dict__.get(name)
+        if orig is None or getattr(orig, "_hide_thinking_patched", False):
+            return
+        wrapped = factory(orig)
+        wrapped._hide_thinking_patched = True
+        setattr(cls, name, wrapped)
+        self._patched.append((cls, name, orig))
+
+    def _install_send_patch(self) -> None:
+        if self._patched:
+            return
+        plugin = self
+
+        def send_factory(orig):
+            async def patched_send(event, message, *args, **kwargs):
+                if plugin._enabled() and not plugin._patching:
+                    plugin._patching = True
+                    try:
+                        message = plugin._scrub_message(message)
+                        chain = getattr(message, "chain", None)
+                        if chain is not None and len(chain) == 0:
+                            return None
+                    except Exception:
+                        logger.error("[HideThinking] send 清洗失败", exc_info=True)
+                    finally:
+                        plugin._patching = False
+                return await orig(event, message, *args, **kwargs)
+
+            return patched_send
+
+        def stream_factory(orig):
+            async def patched_send_streaming(event, generator, *args, **kwargs):
+                if not plugin._enabled() or generator is None:
+                    return await orig(event, generator, *args, **kwargs)
+
+                async def cleaned_gen():
+                    async for chain in generator:
+                        try:
+                            chain = plugin._scrub_message(chain)
+                            inner = getattr(chain, "chain", None)
+                            if inner is not None and len(inner) == 0:
+                                continue
+                        except Exception:
+                            logger.error("[HideThinking] 流式清洗失败", exc_info=True)
+                        yield chain
+
+                return await orig(event, cleaned_gen(), *args, **kwargs)
+
+            return patched_send_streaming
+
+        for cls in self._iter_event_classes():
+            self._patch_method(cls, "send", send_factory)
+            self._patch_method(cls, "send_streaming", stream_factory)
+        logger.info("[HideThinking] 已拦截 %s 个 send 出口", len(self._patched))
+
+    def _remove_send_patch(self) -> None:
+        for cls, name, orig in reversed(self._patched):
+            try:
+                setattr(cls, name, orig)
+            except Exception:
+                continue
+        self._patched.clear()
 
     @filter.on_llm_response(priority=-100)
     async def on_llm_response(self, event: AstrMessageEvent, resp: LLMResponse):
