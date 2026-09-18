@@ -1,0 +1,20 @@
+{
+  "enabled": {
+    "description": "启用插件",
+    "type": "bool",
+    "hint": "关闭后不再隐藏思考内容。",
+    "default": true
+  },
+  "strip_tags": {
+    "description": "删除思维链标签",
+    "type": "bool",
+    "hint": "删除 <think> / <thinking> / <reasoning> 等标签及其内部思考，只留正文。",
+    "default": true
+  },
+  "strip_injected": {
+    "description": "删除已拼进正文的思考块",
+    "type": "bool",
+    "hint": "删除回复开头的「🤔 思考:」整段（AstrBot 开启显示思考内容时会拼进去）。",
+    "default": true
+  }
+}
