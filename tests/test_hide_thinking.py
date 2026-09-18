@@ -142,15 +142,17 @@ from main import (  # noqa: E402
     clean_reply_text,
     collapse_duplicated_text,
     strip_injected_reasoning,
+    strip_recent_overlap,
     strip_special_tokens,
     strip_think_tags,
 )
 
 
 class FakeEvent:
-    def __init__(self, chain=None, extra=None):
+    def __init__(self, chain=None, extra=None, umo="sess-1"):
         self._extras = dict(extra or {})
         self._result = SimpleNamespace(chain=list(chain or []))
+        self.unified_msg_origin = umo
 
     def get_extra(self, key=None, default=None):
         if key is None:
@@ -276,6 +278,22 @@ class TestCollapseDuplicate(unittest.TestCase):
         self.assertEqual(collapse_duplicated_text(src), src)
 
 
+class TestRecentOverlap(unittest.TestCase):
+    def test_user_screenshot(self):
+        prev = "喏 可爱的给你 别得寸进尺啊宝宝"
+        nxt = "好 给你找可爱的喏 可爱的给你 别得寸进尺啊宝宝"
+        self.assertEqual(strip_recent_overlap(nxt, [prev]), "好 给你找可爱的")
+
+    def test_exact_same_dropped(self):
+        prev = "喏 可爱的给你 别得寸进尺啊宝宝"
+        self.assertEqual(strip_recent_overlap(prev, [prev]), "")
+
+    def test_unrelated_kept(self):
+        prev = "喏 可爱的给你 别得寸进尺啊宝宝"
+        nxt = "今天天气不错哦亲"
+        self.assertEqual(strip_recent_overlap(nxt, [prev]), nxt)
+
+
 class TestCleanReply(unittest.TestCase):
     def test_both(self):
         src = "🤔 思考: xx\n\n────\n<think>t</think>你好"
@@ -367,6 +385,31 @@ class TestPluginHooks(unittest.TestCase):
             result = _run(AstrMessageEvent().send(msg))
             self.assertIsNone(result)
             self.assertEqual(called["n"], 0)
+        finally:
+            _run(plugin.terminate())
+
+    def test_send_patch_strips_cross_message_overlap(self):
+        captured = []
+
+        async def orig_send(self, message, *a, **k):
+            captured.append(message.chain[0].text if message.chain else "")
+            return "ok"
+
+        setattr(AstrMessageEvent, "send", orig_send)
+        plugin = HideThinking(context=None, config={"enabled": True})
+        try:
+            _run(plugin.initialize())
+            event = FakeEvent(umo="g1")
+            first = SimpleNamespace(chain=[Plain("喏 可爱的给你 别得寸进尺啊宝宝")])
+            second = SimpleNamespace(
+                chain=[Plain("好 给你找可爱的喏 可爱的给你 别得寸进尺啊宝宝")]
+            )
+            _run(AstrMessageEvent.send(event, first))
+            _run(AstrMessageEvent.send(event, second))
+            self.assertEqual(
+                captured,
+                ["喏 可爱的给你 别得寸进尺啊宝宝", "好 给你找可爱的"],
+            )
         finally:
             _run(plugin.terminate())
 

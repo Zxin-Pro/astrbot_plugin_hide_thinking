@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import time
 from typing import Any
 
 from astrbot.api import logger
@@ -54,6 +55,9 @@ _SPECIAL_TOKEN = re.compile(
 
 # 整段复读折叠：半段太短不处理，避免误伤「哈哈哈哈」
 _MIN_DUP_UNIT = 8
+# 跨条去重：分段发出后，后一条把前一条接在尾巴上
+_RECENT_TTL = 60.0
+_RECENT_MAX = 8
 
 
 def _is_think_tag(name: str) -> bool:
@@ -140,6 +144,24 @@ def collapse_duplicated_text(text: str) -> str:
     return s.strip()
 
 
+def strip_recent_overlap(text: str, recents: list[str], min_len: int = _MIN_DUP_UNIT) -> str:
+    """后一条把刚发过的句子接在尾巴上时，把尾巴剪掉。"""
+    t = (text or "").strip()
+    if not t:
+        return t
+    for prev in recents:
+        p = (prev or "").strip()
+        if len(p) < min_len:
+            continue
+        if t == p:
+            return ""
+        if t.endswith(p):
+            t = t[: -len(p)].rstrip()
+            if not t:
+                return ""
+    return t
+
+
 def clean_reply_text(
     text: str,
     *,
@@ -178,7 +200,7 @@ def _is_lark_reasoning_comp(comp: Any) -> bool:
     "astrbot_plugin_hide_thinking",
     "Zxin-Pro",
     "隐藏思考/结束符，并折叠整段复读",
-    "1.3.0",
+    "1.4.0",
     "https://github.com/Zxin-Pro/astrbot_plugin_hide_thinking",
 )
 class HideThinking(Star):
@@ -187,6 +209,7 @@ class HideThinking(Star):
         self.config = config if isinstance(config, dict) else {}
         self._patched: list[tuple[Any, str, Any]] = []
         self._patching = False
+        self._recent: dict[str, list[tuple[float, str]]] = {}
 
     async def initialize(self):
         try:
@@ -214,6 +237,66 @@ class HideThinking(Star):
 
     def _collapse_duplicate(self) -> bool:
         return _to_bool(self.config.get("collapse_duplicate", True), True)
+
+    def _session_key(self, event: Any) -> str:
+        getter = getattr(event, "unified_msg_origin", None)
+        if callable(getter):
+            try:
+                val = getter()
+                if val:
+                    return str(val)
+            except Exception:
+                pass
+        elif getter:
+            return str(getter)
+        return "default"
+
+    def _purge_recent(self, sid: str, now: float | None = None) -> list[str]:
+        now = time.monotonic() if now is None else now
+        items = [
+            (ts, txt)
+            for ts, txt in self._recent.get(sid, [])
+            if now - ts <= _RECENT_TTL and txt
+        ]
+        items = items[-_RECENT_MAX:]
+        if items:
+            self._recent[sid] = items
+        else:
+            self._recent.pop(sid, None)
+        return [txt for _, txt in reversed(items)]
+
+    def _remember(self, sid: str, text: str) -> None:
+        text = (text or "").strip()
+        if len(text) < _MIN_DUP_UNIT:
+            return
+        now = time.monotonic()
+        items = [
+            (ts, txt)
+            for ts, txt in self._recent.get(sid, [])
+            if now - ts <= _RECENT_TTL
+        ]
+        items.append((now, text))
+        self._recent[sid] = items[-_RECENT_MAX:]
+
+    def _apply_recent(self, event: Any, chain: list[Any]) -> list[Any]:
+        if not self._collapse_duplicate() or not chain:
+            return chain
+        sid = self._session_key(event)
+        recents = self._purge_recent(sid)
+        new_chain: list[Any] = []
+        outgoing: list[str] = []
+        for comp in chain:
+            if isinstance(comp, Plain) and comp.text is not None:
+                cleaned = strip_recent_overlap(comp.text, recents + outgoing)
+                if not cleaned:
+                    continue
+                if cleaned != comp.text:
+                    comp.text = cleaned
+                outgoing.append(cleaned)
+            new_chain.append(comp)
+        for text in outgoing:
+            self._remember(sid, text)
+        return new_chain
 
     def _clean(self, text: str) -> str:
         return clean_reply_text(
@@ -245,15 +328,15 @@ class HideThinking(Star):
             new_chain.append(comp)
         return new_chain
 
-    def _scrub_message(self, message: Any) -> Any:
+    def _scrub_message(self, message: Any, event: Any = None) -> Any:
         if not self._enabled() or message is None:
             return message
         chain = getattr(message, "chain", None)
         if chain is None:
             return message
         new_chain = self._scrub_chain(list(chain))
-        if new_chain is chain:
-            return message
+        if event is not None:
+            new_chain = self._apply_recent(event, new_chain)
         try:
             message.chain = new_chain
         except Exception:
@@ -294,7 +377,7 @@ class HideThinking(Star):
                 if plugin._enabled() and not plugin._patching:
                     plugin._patching = True
                     try:
-                        message = plugin._scrub_message(message)
+                        message = plugin._scrub_message(message, event)
                         chain = getattr(message, "chain", None)
                         if chain is not None and len(chain) == 0:
                             return None
@@ -314,7 +397,7 @@ class HideThinking(Star):
                 async def cleaned_gen():
                     async for chain in generator:
                         try:
-                            chain = plugin._scrub_message(chain)
+                            chain = plugin._scrub_message(chain, event)
                             inner = getattr(chain, "chain", None)
                             if inner is not None and len(inner) == 0:
                                 continue
