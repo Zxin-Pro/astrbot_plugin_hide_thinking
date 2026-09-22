@@ -77,6 +77,15 @@ def _install_stubs() -> None:
 
             return deco
 
+        @staticmethod
+        def on_agent_done(priority=0):
+            def deco(fn):
+                fn._priority = priority
+                fn._hook = "on_agent_done"
+                return fn
+
+            return deco
+
     class AstrMessageEvent:
         async def send(self, message):
             return None
@@ -673,6 +682,65 @@ class TestPluginHooks(unittest.TestCase):
             _run(AstrMessageEvent.send(event, spaced_first))
             _run(AstrMessageEvent.send(event, spaceless_second))
             self.assertEqual(captured, ["37块了啊额度不是我能充的你自己看着办我又不能变钱出来"])
+        finally:
+            _run(plugin.terminate())
+
+    def test_on_agent_done_flushes_event_sourced_pending(self):
+        captured = []
+
+        async def orig_send(self, message, *a, **k):
+            captured.append(message.chain[0].text if message.chain else "")
+            return "ok"
+
+        setattr(AstrMessageEvent, "send", orig_send)
+        plugin = HideThinking(context=None, config={"enabled": True, "dedup_window": 30})
+        try:
+            _run(plugin.initialize())
+            event = FakeEvent(umo="g19")
+            _run(AstrMessageEvent.send(event, SimpleNamespace(chain=[Plain("喏 可爱的给你 别得寸进尺啊宝宝")])))
+            self.assertEqual(captured, [])
+            _run(plugin.on_agent_done(event, None, None))
+            self.assertEqual(captured, ["喏 可爱的给你 别得寸进尺啊宝宝"])
+        finally:
+            _run(plugin.terminate())
+
+    def test_on_agent_done_keeps_context_pending(self):
+        sent = []
+
+        async def orig_cm(self_ctx, session, message_chain):
+            sent.append(message_chain.chain[0].text if message_chain.chain else "")
+            return True
+
+        async def orig_send(self, message, *a, **k):
+            sent.append(message.chain[0].text if message.chain else "")
+            return "ok"
+
+        setattr(StarContext, "send_message", orig_cm)
+        setattr(AstrMessageEvent, "send", orig_send)
+        plugin = HideThinking(
+            context=None,
+            config={"enabled": True, "dedup_window": 30, "dedup_prefer": "second"},
+        )
+        try:
+            _run(plugin.initialize())
+            sid = "aiocqhttp:GroupMessage:g20"
+            spaceless = SimpleNamespace(
+                chain=[Plain("37块了啊额度不是我能充的你自己看着办我又不能变钱出来")]
+            )
+            spaced = SimpleNamespace(
+                chain=[Plain("37块了啊 额度不是我能充的 你自己看着办 我又不能变钱出来")]
+            )
+            _run(StarContext().send_message(sid, spaceless))
+            self.assertEqual(sent, [])
+            # agent 结束：工具那条仍挂着
+            _run(plugin.on_agent_done(FakeEvent(umo=sid), None, None))
+            self.assertEqual(sent, [])
+            # 正文到来 → 留第二遍（空格版）
+            _run(AstrMessageEvent.send(FakeEvent(umo=sid), spaced))
+            self.assertEqual(
+                sent,
+                ["37块了啊 额度不是我能充的 你自己看着办 我又不能变钱出来"],
+            )
         finally:
             _run(plugin.terminate())
 

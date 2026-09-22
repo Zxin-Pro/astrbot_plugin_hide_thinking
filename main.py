@@ -357,7 +357,7 @@ def _is_lark_reasoning_comp(comp: Any) -> bool:
     "astrbot_plugin_hide_thinking",
     "Zxin-Pro",
     "隐藏思考/结束符/工具调用泄漏，并折叠整段复读",
-    "1.9.0",
+    "1.10.0",
     "https://github.com/Zxin-Pro/astrbot_plugin_hide_thinking",
 )
 class HideThinking(Star):
@@ -547,20 +547,27 @@ class HideThinking(Star):
                 pass
         await flush(message)
 
-    async def _flush_sid(self, sid: str) -> None:
+    async def _flush_sid(self, sid: str, only_source: str | None = None) -> None:
+        item = self._pending.get(sid)
+        if not item:
+            return
+        if only_source is not None and item[3] != only_source:
+            return
         item = self._pending.pop(sid, None)
         if not item:
             return
-        flush, message, task = item
+        flush, message, task, _source = item
         if task is not None:
             task.cancel()
         await self._flush_pending_message(sid, flush, message)
 
-    async def _buffer_message(self, sid: str, flush: Any, message: Any) -> bool:
+    async def _buffer_message(
+        self, sid: str, flush: Any, message: Any, source: str = "event"
+    ) -> bool:
         """纯文本消息进缓冲；同句不同空格只发更自然的那条。返回 True 表示已接管。"""
         item = self._pending.pop(sid, None)
         if item is not None:
-            p_flush, p_msg, p_task = item
+            p_flush, p_msg, p_task, _p_source = item
             if p_task is not None:
                 p_task.cancel()
             p_text = self._plain_text_of(p_msg)
@@ -588,7 +595,7 @@ class HideThinking(Star):
             task = None
             await self._flush_pending_message(sid, flush, message)
             return True
-        self._pending[sid] = (flush, message, task)
+        self._pending[sid] = (flush, message, task, source)
         return True
 
     def _iter_event_classes(self):
@@ -640,7 +647,7 @@ class HideThinking(Star):
                         and plugin._is_pure_plain(message)
                     ):
                         await plugin._buffer_message(
-                            sid, lambda m: orig(event, m), message
+                            sid, lambda m: orig(event, m), message, "event"
                         )
                         return None
                     try:
@@ -683,6 +690,7 @@ class HideThinking(Star):
                                 sid,
                                 lambda m: orig(ctx_self, session, m),
                                 message_chain,
+                                "context",
                             )
                             return True
                         try:
@@ -747,6 +755,21 @@ class HideThinking(Star):
                 await self._flush_sid(sid)
         except Exception:
             logger.error("[HideThinking] 冲刷上轮缓冲失败", exc_info=True)
+
+    @filter.on_agent_done(priority=-100)
+    async def on_agent_done(self, event: AstrMessageEvent, *args, **kwargs):
+        """一轮 agent 结束：把本轮走 event.send 的缓冲立刻发出，避免等窗口。
+
+        工具（Context.send_message）那条先挂着的保留着，等正文来替换，否则第二条空格版会被丢掉。
+        """
+        if not self._enabled():
+            return
+        try:
+            sid = self._session_key(event)
+            if sid in self._pending:
+                await self._flush_sid(sid, only_source="event")
+        except Exception:
+            logger.error("[HideThinking] 结束轮冲刷失败", exc_info=True)
 
     @filter.after_message_sent(priority=-100)
     async def on_after_message_sent(self, event: AstrMessageEvent):
