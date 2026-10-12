@@ -1,6 +1,6 @@
 # astrbot_plugin_hide_thinking
 
-隐藏模型思考内容、结束符和泄漏的工具调用，并折叠整段复读。QQ / 群聊只发正文。
+隐藏模型思考内容、结束符、垃圾标签（如 `</div>`）和泄漏的工具调用，并折叠整段复读。QQ / 群聊只发正文。
 
 ## 挡什么
 
@@ -15,7 +15,7 @@ AstrBot 会把接口返回的 `reasoning_content` 挂到事件 extra，发送前
 
 Grok / DeepSeek 等模型还会在正文里塞 `<think>…</think>`，以及漏出来的结束符 `<|eos|>`。
 
-本插件做六件事：
+本插件做七件事：
 
 1. 清掉 `reasoning_content` 和 `_llm_reasoning_content`，发送前不再拼接思考
 2. 删掉 `<think>` / `<thinking>` / `<reasoning>` 等标签及内部内容
@@ -23,6 +23,7 @@ Grok / DeepSeek 等模型还会在正文里塞 `<think>…</think>`，以及漏�
 4. 删掉漏进正文的结束符：`<|eos|>` `<|im_end|>` `</s>` 等
 5. 同一句话被粘两遍时只留一句；分段发出后，后一条把前一条接在尾巴上也剪掉（空格不同也算同一句）
 6. 模型把 `<tool_call>` / `send_message_to_user` 当正文发出时，抽出里面的人话，外壳丢掉
+7. 删掉混进正文的垃圾标签（默认 `</div>`；要删别的可在配置里加，如 `</p>`）
 
 不改模型请求，不影响历史里的签名字段。
 
@@ -36,6 +37,8 @@ Grok / DeepSeek 等模型还会在正文里塞 `<think>…</think>`，以及漏�
 | strip_special | true | 删 `<|eos|>` 等结束符 |
 | collapse_duplicate | true | 整段复读只留一句，跨条尾巴重复也剪（忽略空格） |
 | strip_tool_call | true | 抽出工具调用里的人话，丢掉 XML 外壳 |
+| strip_junk_tags | true | 删垃圾标签（默认 `</div>`，出现即删） |
+| junk_tags | `["</div>"]` | 要删除的垃圾标签列表；大小写不敏感，标签内空白也识别（`</ div >`）；非标签内容按字面量删 |
 | dedup_window | 6 | 去重等待窗口（秒）：合并同句不同写法的重复发送；正常回复在本轮发送结束时立刻冲刷，不被拖慢；0 关闭缓冲 |
 | dedup_prefer | second | 同句重复时保留哪条：second=第二遍（默认，留正文空格版）/ first=第一遍 / spaced=空格更多的那条 |
 

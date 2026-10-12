@@ -4,6 +4,7 @@ import asyncio
 import json
 import re
 import time
+from collections.abc import Iterable
 from typing import Any
 
 from astrbot.api import logger
@@ -136,6 +137,61 @@ def strip_special_tokens(text: str) -> str:
     if not text:
         return text
     return _SPECIAL_TOKEN.sub("", text)
+
+
+# 垃圾标签（如 </div>）：出现即删，不删标签内部内容（标签本身没内容）
+_JUNK_TAG_LIKE = re.compile(r"<\s*(/?)\s*([A-Za-z][A-Za-z0-9_-]*)\s*(/?)>")
+_JUNK_PATTERN_CACHE: dict[tuple[str, ...], re.Pattern[str] | None] = {}
+
+
+def _build_junk_pattern(items: tuple[str, ...]) -> re.Pattern[str] | None:
+    """把配置的垃圾标签编译成一个匹配模式。
+
+    - </div> 这类标签：大小写不敏感，标签名两侧空白宽容（</ div > 也能删）；
+    - 其他内容按字面量删除（大小写不敏感）。
+    """
+    parts: list[str] = []
+    for item in items:
+        m = _JUNK_TAG_LIKE.fullmatch(item)
+        if not m:
+            parts.append(re.escape(item))
+            continue
+        close, name, self_close = m.group(1), re.escape(m.group(2)), m.group(3)
+        if close:
+            parts.append(rf"</\s*{name}\s*>")
+        elif self_close:
+            parts.append(rf"<\s*{name}\s*/\s*>")
+        else:
+            parts.append(rf"<\s*{name}\s*>")
+    if not parts:
+        return None
+    return re.compile("|".join(parts), re.IGNORECASE)
+
+
+def strip_junk_tags(text: str, tags: Iterable[str]) -> str:
+    """删除指定的垃圾标签/字符串（如 </div>），出现即删。
+
+    任何异常都返回原文，保证过滤失败不影响发送。
+    """
+    if not text or not tags:
+        return text
+    if isinstance(tags, str):
+        tags = [tags]
+    try:
+        key = tuple(sorted({str(t).strip().lower() for t in tags if str(t).strip()}))
+    except Exception:
+        return text
+    if not key:
+        return text
+    if key not in _JUNK_PATTERN_CACHE:
+        _JUNK_PATTERN_CACHE[key] = _build_junk_pattern(key)
+    pat = _JUNK_PATTERN_CACHE[key]
+    if pat is None:
+        return text
+    try:
+        return pat.sub("", text)
+    except Exception:
+        return text
 
 
 def _extract_plain_from_obj(obj: Any) -> str:
@@ -323,6 +379,8 @@ def clean_reply_text(
     strip_special: bool = True,
     collapse_duplicate: bool = True,
     strip_tool_call: bool = True,
+    strip_junk: bool = True,
+    junk_tags: Iterable[str] = ("</div>",),
 ) -> str:
     if not text:
         return text
@@ -334,6 +392,8 @@ def clean_reply_text(
         text = strip_think_tags(text)
     if strip_special:
         text = strip_special_tokens(text)
+    if strip_junk:
+        text = strip_junk_tags(text, junk_tags)
     if collapse_duplicate:
         text = dedupe_lines_compact(text)
         text = collapse_duplicated_text(text)
@@ -356,8 +416,8 @@ def _is_lark_reasoning_comp(comp: Any) -> bool:
 @register(
     "astrbot_plugin_hide_thinking",
     "Zxin-Pro",
-    "隐藏思考/结束符/工具调用泄漏，并折叠整段复读",
-    "1.10.0",
+    "隐藏思考/结束符/工具调用泄漏和垃圾标签，并折叠整段复读",
+    "1.11.0",
     "https://github.com/Zxin-Pro/astrbot_plugin_hide_thinking",
 )
 class HideThinking(Star):
@@ -413,6 +473,17 @@ class HideThinking(Star):
 
     def _strip_tool_call(self) -> bool:
         return _to_bool(self.config.get("strip_tool_call", True), True)
+
+    def _strip_junk(self) -> bool:
+        return _to_bool(self.config.get("strip_junk_tags", True), True)
+
+    def _junk_tags(self) -> list[str]:
+        raw = self.config.get("junk_tags", ["</div>"])
+        if isinstance(raw, str):
+            raw = re.split(r"[,，;；\s]+", raw)
+        if not isinstance(raw, (list, tuple)):
+            return ["</div>"]
+        return [str(t).strip() for t in raw if str(t).strip()]
 
     def _session_key(self, event: Any) -> str:
         getter = getattr(event, "unified_msg_origin", None)
@@ -481,6 +552,8 @@ class HideThinking(Star):
             strip_special=self._strip_special(),
             collapse_duplicate=self._collapse_duplicate(),
             strip_tool_call=self._strip_tool_call(),
+            strip_junk=self._strip_junk(),
+            junk_tags=self._junk_tags(),
         )
 
     def _clear_reasoning(self, event: AstrMessageEvent, resp: LLMResponse | None) -> None:

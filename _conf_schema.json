@@ -35,6 +35,20 @@
     "hint": "模型把 <tool_call> / send_message_to_user 当正文发出时，抽出里面的人话，外壳丢掉。",
     "default": true
   },
+  "strip_junk_tags": {
+    "description": "删除垃圾标签",
+    "type": "bool",
+    "hint": "删除混进正文的垃圾标签（默认 </div>），出现即删。",
+    "default": true
+  },
+  "junk_tags": {
+    "description": "要删除的垃圾标签列表",
+    "type": "list",
+    "hint": "默认过滤 </div>；要删别的就往列表里加，如 </p>、<br>。大小写不敏感，标签内空白也能识别（</ div >）；非标签内容按字面量删。",
+    "default": [
+      "</div>"
+    ]
+  },
   "dedup_window": {
     "description": "跨条去重等待窗口（秒）",
     "type": "int",

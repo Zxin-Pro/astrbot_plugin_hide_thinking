@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
 import types
 import unittest
@@ -182,13 +183,14 @@ from astrbot.api.message_components import Plain  # noqa: E402
 from astrbot.api.provider import LLMResponse  # noqa: E402
 from astrbot.core.star.context import Context as StarContext  # noqa: E402
 
-sys.path.insert(0, "/var/minis/workspace/astrbot_plugin_hide_thinking")
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 from main import (  # noqa: E402
     HideThinking,
     clean_reply_text,
     collapse_duplicated_text,
     extract_tool_call_text,
     strip_injected_reasoning,
+    strip_junk_tags,
     strip_recent_overlap,
     strip_special_tokens,
     strip_think_tags,
@@ -296,6 +298,45 @@ class TestStripSpecial(unittest.TestCase):
         self.assertEqual(strip_special_tokens(src), src)
 
 
+class TestStripJunkTags(unittest.TestCase):
+    def test_close_tag_removed(self):
+        self.assertEqual(strip_junk_tags("你好呀</div>", ["</div>"]), "你好呀")
+
+    def test_case_insensitive(self):
+        self.assertEqual(strip_junk_tags("你好</DIV>", ["</div>"]), "你好")
+
+    def test_inner_space_tolerant(self):
+        self.assertEqual(strip_junk_tags("你好</ div >", ["</div>"]), "你好")
+
+    def test_open_tag_not_touched(self):
+        self.assertEqual(strip_junk_tags("<div>x", ["</div>"]), "<div>x")
+
+    def test_open_and_close_pair(self):
+        self.assertEqual(
+            strip_junk_tags("<div>a</div>", ["<div>", "</div>"]), "a"
+        )
+
+    def test_self_closing(self):
+        self.assertEqual(strip_junk_tags("a<br/>b", ["<br/>"]), "ab")
+
+    def test_literal_item(self):
+        self.assertEqual(strip_junk_tags("完【END】", ["【END】"]), "完")
+
+    def test_multiple_items(self):
+        self.assertEqual(
+            strip_junk_tags("a</div>b</p>c", ["</div>", "</p>"]), "abc"
+        )
+
+    def test_empty_tags_noop(self):
+        self.assertEqual(strip_junk_tags("a</div>", []), "a</div>")
+
+    def test_none_tags_noop(self):
+        self.assertEqual(strip_junk_tags("a</div>", None), "a</div>")
+
+    def test_no_target_noop(self):
+        self.assertEqual(strip_junk_tags("今天天气不错", ["</div>"]), "今天天气不错")
+
+
 class TestCollapseDuplicate(unittest.TestCase):
     def test_user_example(self):
         src = "早啊宝宝 刚醒吗 赖床去吧早啊宝宝 刚醒吗 赖床去吧"
@@ -382,6 +423,18 @@ class TestCleanReply(unittest.TestCase):
         )
         self.assertEqual(clean_reply_text(src), "又被拦了 黑丝出不来 换词再说")
 
+    def test_junk_div_removed_by_default(self):
+        self.assertEqual(clean_reply_text("你好呀</div>"), "你好呀")
+
+    def test_junk_div_with_think(self):
+        self.assertEqual(clean_reply_text("<think>x</think>你好</div>"), "你好")
+
+    def test_junk_off_keeps(self):
+        self.assertEqual(clean_reply_text("你好</div>", strip_junk=False), "你好</div>")
+
+    def test_junk_tags_empty_keeps(self):
+        self.assertEqual(clean_reply_text("你好</div>", junk_tags=()), "你好</div>")
+
 
 class TestExtractToolCall(unittest.TestCase):
     def test_full_block(self):
@@ -442,6 +495,32 @@ class TestPluginHooks(unittest.TestCase):
         _run(self.plugin.on_llm_response(event, resp))
         self.assertEqual(resp.completion_text, "对外说")
 
+    def test_strips_junk_from_completion(self):
+        event = FakeEvent()
+        resp = LLMResponse(completion_text="对外说</div>")
+        _run(self.plugin.on_llm_response(event, resp))
+        self.assertEqual(resp.completion_text, "对外说")
+
+    def test_junk_disabled_keeps_completion(self):
+        plugin = HideThinking(
+            context=None,
+            config={"enabled": True, "dedup_window": 0, "strip_junk_tags": False},
+        )
+        event = FakeEvent()
+        resp = LLMResponse(completion_text="对外说</div>")
+        _run(plugin.on_llm_response(event, resp))
+        self.assertEqual(resp.completion_text, "对外说</div>")
+
+    def test_custom_junk_tags(self):
+        plugin = HideThinking(
+            context=None,
+            config={"enabled": True, "dedup_window": 0, "junk_tags": ["</p>"]},
+        )
+        event = FakeEvent()
+        resp = LLMResponse(completion_text="对外说</div></p>")
+        _run(plugin.on_llm_response(event, resp))
+        self.assertEqual(resp.completion_text, "对外说</div>")
+
     def test_decorating_drops_eos_plain(self):
         event = FakeEvent(chain=[Plain("对外正文<|eos|>")])
         _run(self.plugin.on_decorating_result(event))
@@ -467,6 +546,24 @@ class TestPluginHooks(unittest.TestCase):
         try:
             _run(plugin.initialize())
             msg = SimpleNamespace(chain=[Plain("行不行啊<|eos|>")])
+            result = _run(AstrMessageEvent().send(msg))
+            self.assertEqual(captured["text"], "行不行啊")
+            self.assertEqual(result, "ok")
+        finally:
+            _run(plugin.terminate())
+
+    def test_send_patch_strips_junk(self):
+        captured = {}
+
+        async def orig_send(self, message, *a, **k):
+            captured["text"] = message.chain[0].text
+            return "ok"
+
+        setattr(AstrMessageEvent, "send", orig_send)
+        plugin = HideThinking(context=None, config={"enabled": True, "dedup_window": 0})
+        try:
+            _run(plugin.initialize())
+            msg = SimpleNamespace(chain=[Plain("行不行啊</div>")])
             result = _run(AstrMessageEvent().send(msg))
             self.assertEqual(captured["text"], "行不行啊")
             self.assertEqual(result, "ok")
