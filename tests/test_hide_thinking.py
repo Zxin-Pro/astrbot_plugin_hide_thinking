@@ -269,6 +269,15 @@ class TestStripInjected(unittest.TestCase):
         src = "🤔思考：内部推理\n\n真正回复"
         self.assertEqual(strip_injected_reasoning(src).strip(), "真正回复")
 
+    def test_blank_line_inside_reasoning(self):
+        # 思考正文里本来就可能有空行；按 ──── 分隔线切，别只删一半
+        src = "🤔 思考: 第一段推理\n\n第二段推理\n\n────\n真正回复"
+        self.assertEqual(strip_injected_reasoning(src).strip(), "真正回复")
+
+    def test_multiple_blank_lines(self):
+        src = "🤔 思考: 甲\n\n乙\n\n丙\n\n────\n正文"
+        self.assertEqual(strip_injected_reasoning(src).strip(), "正文")
+
     def test_normal_emoji_kept(self):
         src = "你好🤔 这题难"
         self.assertEqual(strip_injected_reasoning(src), src)
@@ -589,62 +598,70 @@ class TestPluginHooks(unittest.TestCase):
             _run(plugin.terminate())
 
     def test_send_patch_strips_cross_message_overlap(self):
-        captured = []
+        sent = []
+
+        async def orig_cm(self_ctx, session, message_chain):
+            sent.append(message_chain.chain[0].text if message_chain.chain else "")
+            return True
 
         async def orig_send(self, message, *a, **k):
-            captured.append(message.chain[0].text if message.chain else "")
+            sent.append(message.chain[0].text if message.chain else "")
             return "ok"
 
+        setattr(StarContext, "send_message", orig_cm)
         setattr(AstrMessageEvent, "send", orig_send)
         plugin = HideThinking(context=None, config={"enabled": True, "dedup_window": 0})
         try:
             _run(plugin.initialize())
-            event = FakeEvent(umo="g1")
-            first = SimpleNamespace(chain=[Plain("喏 可爱的给你 别得寸进尺啊宝宝")])
-            second = SimpleNamespace(
-                chain=[Plain("好 给你找可爱的喏 可爱的给你 别得寸进尺啊宝宝")]
+            sid = "aiocqhttp:GroupMessage:g1"
+            # 工具先发一遍
+            _run(
+                StarContext().send_message(
+                    sid, SimpleNamespace(chain=[Plain("喏 可爱的给你 别得寸进尺啊宝宝")])
+                )
             )
-            _run(AstrMessageEvent.send(event, first))
-            _run(AstrMessageEvent.send(event, second))
+            # 正文把上一条接在尾巴上
+            _run(
+                AstrMessageEvent.send(
+                    FakeEvent(umo=sid),
+                    SimpleNamespace(
+                        chain=[Plain("好 给你找可爱的喏 可爱的给你 别得寸进尺啊宝宝")]
+                    ),
+                )
+            )
             self.assertEqual(
-                captured,
+                sent,
                 ["喏 可爱的给你 别得寸进尺啊宝宝", "好 给你找可爱的"],
             )
         finally:
             _run(plugin.terminate())
 
-    def test_send_patch_drops_space_variant(self):
-        captured = []
+    def test_send_patch_drops_cross_path_duplicate(self):
+        sent = []
+
+        async def orig_cm(self_ctx, session, message_chain):
+            sent.append(message_chain.chain[0].text if message_chain.chain else "")
+            return True
 
         async def orig_send(self, message, *a, **k):
-            captured.append(message.chain[0].text if message.chain else "")
+            sent.append(message.chain[0].text if message.chain else "")
             return "ok"
 
+        setattr(StarContext, "send_message", orig_cm)
         setattr(AstrMessageEvent, "send", orig_send)
         plugin = HideThinking(context=None, config={"enabled": True, "dedup_window": 0})
         try:
             _run(plugin.initialize())
-            event = FakeEvent(umo="g2")
-            first = SimpleNamespace(
-                chain=[Plain("37块了啊 额度不是我能充的 你自己看着办 我又不能变钱出来")]
+            sid = "aiocqhttp:GroupMessage:g2"
+            text = "37块了啊 额度不是我能充的 你自己看着办 我又不能变钱出来"
+            _run(StarContext().send_message(sid, SimpleNamespace(chain=[Plain(text)])))
+            r = _run(
+                AstrMessageEvent.send(
+                    FakeEvent(umo=sid), SimpleNamespace(chain=[Plain(text)])
+                )
             )
-            second = SimpleNamespace(
-                chain=[Plain("37块了啊额度不是我能充的你自己看着办我又不能变钱出来")]
-            )
-            third = SimpleNamespace(
-                chain=[Plain("想得美我又没钱包自己去打工37块还不够你饿着吗")]
-            )
-            _run(AstrMessageEvent.send(event, first))
-            r2 = _run(AstrMessageEvent.send(event, second))
-            _run(AstrMessageEvent.send(event, third))
-            self.assertIsNone(r2)
-            self.assertEqual(
-                captured,
-                [
-                    "37块了啊 额度不是我能充的 你自己看着办 我又不能变钱出来",
-                    "想得美我又没钱包自己去打工37块还不够你饿着吗",
-                ],
-            )
+            self.assertIsNone(r)
+            self.assertEqual(sent, [text])
         finally:
             _run(plugin.terminate())
 
@@ -701,103 +718,114 @@ class TestPluginHooks(unittest.TestCase):
             _run(plugin.terminate())
 
     def test_buffer_prefers_spaced_variant(self):
-        captured = []
+        sent = []
 
-        async def orig_send(self, message, *a, **k):
-            captured.append(message.chain[0].text if message.chain else "")
-            return "ok"
+        async def orig_cm(self_ctx, session, message_chain):
+            sent.append(message_chain.chain[0].text if message_chain.chain else "")
+            return True
 
-        setattr(AstrMessageEvent, "send", orig_send)
+        setattr(StarContext, "send_message", orig_cm)
         plugin = HideThinking(
             context=None,
             config={"enabled": True, "dedup_window": 0.05, "dedup_prefer": "spaced"},
         )
         try:
             _run(plugin.initialize())
-            event = FakeEvent(umo="g9")
+            sid = "aiocqhttp:GroupMessage:g9"
             spaceless = SimpleNamespace(
                 chain=[Plain("37块了啊额度不是我能充的你自己看着办我又不能变钱出来")]
             )
             spaced = SimpleNamespace(
                 chain=[Plain("37块了啊 额度不是我能充的 你自己看着办 我又不能变钱出来")]
             )
-            _run(AstrMessageEvent.send(event, spaceless))
-            self.assertEqual(captured, [])
-            _run(AstrMessageEvent.send(event, spaced))
+            _run(StarContext().send_message(sid, spaceless))
+            self.assertEqual(sent, [])
+            _run(StarContext().send_message(sid, spaced))
             self.assertEqual(
-                captured,
+                sent,
                 ["37块了啊 额度不是我能充的 你自己看着办 我又不能变钱出来"],
             )
             _run(asyncio.sleep(0.15))
             self.assertEqual(
-                captured,
+                sent,
                 ["37块了啊 额度不是我能充的 你自己看着办 我又不能变钱出来"],
             )
         finally:
             _run(plugin.terminate())
 
     def test_buffer_flushes_single_after_window(self):
-        captured = []
+        sent = []
 
-        async def orig_send(self, message, *a, **k):
-            captured.append(message.chain[0].text if message.chain else "")
-            return "ok"
+        async def orig_cm(self_ctx, session, message_chain):
+            sent.append(message_chain.chain[0].text if message_chain.chain else "")
+            return True
 
-        setattr(AstrMessageEvent, "send", orig_send)
+        setattr(StarContext, "send_message", orig_cm)
         plugin = HideThinking(context=None, config={"enabled": True, "dedup_window": 0.05})
         try:
             _run(plugin.initialize())
-            event = FakeEvent(umo="g10")
-            _run(AstrMessageEvent.send(event, SimpleNamespace(chain=[Plain("喏 可爱的给你 别得寸进尺啊宝宝")])))
-            self.assertEqual(captured, [])
+            sid = "aiocqhttp:GroupMessage:g10"
+            _run(
+                StarContext().send_message(
+                    sid, SimpleNamespace(chain=[Plain("喏 可爱的给你 别得寸进尺啊宝宝")])
+                )
+            )
+            self.assertEqual(sent, [])
             _run(asyncio.sleep(0.15))
-            self.assertEqual(captured, ["喏 可爱的给你 别得寸进尺啊宝宝"])
+            self.assertEqual(sent, ["喏 可爱的给你 别得寸进尺啊宝宝"])
         finally:
             _run(plugin.terminate())
 
     def test_prefer_second_keeps_later_copy(self):
-        captured = []
+        sent = []
 
-        async def orig_send(self, message, *a, **k):
-            captured.append(message.chain[0].text if message.chain else "")
-            return "ok"
+        async def orig_cm(self_ctx, session, message_chain):
+            sent.append(message_chain.chain[0].text if message_chain.chain else "")
+            return True
 
-        setattr(AstrMessageEvent, "send", orig_send)
+        setattr(StarContext, "send_message", orig_cm)
         plugin = HideThinking(
             context=None,
             config={"enabled": True, "dedup_window": 0.05, "dedup_prefer": "second"},
         )
         try:
             _run(plugin.initialize())
-            event = FakeEvent(umo="g16")
+            sid = "aiocqhttp:GroupMessage:g16"
             spaced_first = SimpleNamespace(
                 chain=[Plain("37块了啊 额度不是我能充的 你自己看着办 我又不能变钱出来")]
             )
             spaceless_second = SimpleNamespace(
                 chain=[Plain("37块了啊额度不是我能充的你自己看着办我又不能变钱出来")]
             )
-            _run(AstrMessageEvent.send(event, spaced_first))
-            _run(AstrMessageEvent.send(event, spaceless_second))
-            self.assertEqual(captured, ["37块了啊额度不是我能充的你自己看着办我又不能变钱出来"])
+            _run(StarContext().send_message(sid, spaced_first))
+            _run(StarContext().send_message(sid, spaceless_second))
+            self.assertEqual(
+                sent, ["37块了啊额度不是我能充的你自己看着办我又不能变钱出来"]
+            )
         finally:
             _run(plugin.terminate())
 
-    def test_on_agent_done_flushes_event_sourced_pending(self):
-        captured = []
+    def test_on_agent_done_flushes_pending_when_body_differs(self):
+        sent = []
 
-        async def orig_send(self, message, *a, **k):
-            captured.append(message.chain[0].text if message.chain else "")
-            return "ok"
+        async def orig_cm(self_ctx, session, message_chain):
+            sent.append(message_chain.chain[0].text if message_chain.chain else "")
+            return True
 
-        setattr(AstrMessageEvent, "send", orig_send)
+        setattr(StarContext, "send_message", orig_cm)
         plugin = HideThinking(context=None, config={"enabled": True, "dedup_window": 30})
         try:
             _run(plugin.initialize())
-            event = FakeEvent(umo="g19")
-            _run(AstrMessageEvent.send(event, SimpleNamespace(chain=[Plain("喏 可爱的给你 别得寸进尺啊宝宝")])))
-            self.assertEqual(captured, [])
-            _run(plugin.on_agent_done(event, None, None))
-            self.assertEqual(captured, ["喏 可爱的给你 别得寸进尺啊宝宝"])
+            sid = "aiocqhttp:GroupMessage:g19"
+            _run(
+                StarContext().send_message(
+                    sid, SimpleNamespace(chain=[Plain("喏 可爱的给你 别得寸进尺啊宝宝")])
+                )
+            )
+            self.assertEqual(sent, [])
+            resp = LLMResponse(completion_text="完全不一样的一句正文")
+            _run(plugin.on_agent_done(FakeEvent(umo=sid), None, resp))
+            self.assertEqual(sent, ["喏 可爱的给你 别得寸进尺啊宝宝"])
         finally:
             _run(plugin.terminate())
 
@@ -842,62 +870,70 @@ class TestPluginHooks(unittest.TestCase):
             _run(plugin.terminate())
 
     def test_after_message_sent_flushes_pending(self):
-        captured = []
+        sent = []
 
-        async def orig_send(self, message, *a, **k):
-            captured.append(message.chain[0].text if message.chain else "")
-            return "ok"
+        async def orig_cm(self_ctx, session, message_chain):
+            sent.append(message_chain.chain[0].text if message_chain.chain else "")
+            return True
 
-        setattr(AstrMessageEvent, "send", orig_send)
+        setattr(StarContext, "send_message", orig_cm)
         plugin = HideThinking(context=None, config={"enabled": True, "dedup_window": 30})
         try:
             _run(plugin.initialize())
-            event = FakeEvent(umo="g17")
-            _run(AstrMessageEvent.send(event, SimpleNamespace(chain=[Plain("喏 可爱的给你 别得寸进尺啊宝宝")])))
-            self.assertEqual(captured, [])
-            _run(plugin.on_after_message_sent(event))
-            self.assertEqual(captured, ["喏 可爱的给你 别得寸进尺啊宝宝"])
+            sid = "aiocqhttp:GroupMessage:g17"
+            _run(
+                StarContext().send_message(
+                    sid, SimpleNamespace(chain=[Plain("喏 可爱的给你 别得寸进尺啊宝宝")])
+                )
+            )
+            self.assertEqual(sent, [])
+            _run(plugin.on_after_message_sent(FakeEvent(umo=sid)))
+            self.assertEqual(sent, ["喏 可爱的给你 别得寸进尺啊宝宝"])
         finally:
             _run(plugin.terminate())
 
     def test_on_llm_request_flushes_pending(self):
-        captured = []
+        sent = []
 
-        async def orig_send(self, message, *a, **k):
-            captured.append(message.chain[0].text if message.chain else "")
-            return "ok"
+        async def orig_cm(self_ctx, session, message_chain):
+            sent.append(message_chain.chain[0].text if message_chain.chain else "")
+            return True
 
-        setattr(AstrMessageEvent, "send", orig_send)
+        setattr(StarContext, "send_message", orig_cm)
         plugin = HideThinking(context=None, config={"enabled": True, "dedup_window": 30})
         try:
             _run(plugin.initialize())
-            event = FakeEvent(umo="g18")
-            _run(AstrMessageEvent.send(event, SimpleNamespace(chain=[Plain("喏 可爱的给你 别得寸进尺啊宝宝")])))
-            self.assertEqual(captured, [])
-            _run(plugin.on_llm_request(event, None))
-            self.assertEqual(captured, ["喏 可爱的给你 别得寸进尺啊宝宝"])
+            sid = "aiocqhttp:GroupMessage:g18"
+            _run(
+                StarContext().send_message(
+                    sid, SimpleNamespace(chain=[Plain("喏 可爱的给你 别得寸进尺啊宝宝")])
+                )
+            )
+            self.assertEqual(sent, [])
+            _run(plugin.on_llm_request(FakeEvent(umo=sid), None))
+            self.assertEqual(sent, ["喏 可爱的给你 别得寸进尺啊宝宝"])
         finally:
             _run(plugin.terminate())
 
     def test_buffer_keeps_order_for_distinct(self):
-        captured = []
+        sent = []
 
-        async def orig_send(self, message, *a, **k):
-            captured.append(message.chain[0].text if message.chain else "")
-            return "ok"
+        async def orig_cm(self_ctx, session, message_chain):
+            sent.append(message_chain.chain[0].text if message_chain.chain else "")
+            return True
 
-        setattr(AstrMessageEvent, "send", orig_send)
+        setattr(StarContext, "send_message", orig_cm)
         plugin = HideThinking(context=None, config={"enabled": True, "dedup_window": 0.05})
         try:
             _run(plugin.initialize())
-            event = FakeEvent(umo="g11")
+            sid = "aiocqhttp:GroupMessage:g11"
             texts = ["第一条 哈喽", "第二条 嗯嗯", "第三条 好的"]
             for t in texts:
-                _run(AstrMessageEvent.send(event, SimpleNamespace(chain=[Plain(t)])))
+                _run(StarContext().send_message(sid, SimpleNamespace(chain=[Plain(t)])))
             # 前两条已被冲刷，最后一条等窗口
-            self.assertEqual(captured, ["第一条 哈喽", "第二条 嗯嗯"])
+            self.assertEqual(sent, ["第一条 哈喽", "第二条 嗯嗯"])
             _run(asyncio.sleep(0.15))
-            self.assertEqual(captured, texts)
+            self.assertEqual(sent, texts)
         finally:
             _run(plugin.terminate())
 
@@ -1067,6 +1103,75 @@ class TestPluginHooks(unittest.TestCase):
         with open(main_path, encoding="utf-8") as f:
             body = f.read()
         self.assertNotIn("sk-", body)
+
+    def test_repeat_same_reply_not_dropped(self):
+        # 同一条出口重复说同一句是正常回复，不能被跨条去重吞掉
+        captured = []
+
+        async def orig_send(self, message, *a, **k):
+            captured.append(message.chain[0].text if message.chain else "")
+            return "ok"
+
+        setattr(AstrMessageEvent, "send", orig_send)
+        plugin = HideThinking(context=None, config={"enabled": True, "dedup_window": 0})
+        try:
+            _run(plugin.initialize())
+            event = FakeEvent(umo="gr1")
+            text = "好的我知道了 我马上就去处理这件事"
+            for _ in range(2):
+                _run(
+                    AstrMessageEvent.send(
+                        event, SimpleNamespace(chain=[Plain(text)])
+                    )
+                )
+            self.assertEqual(captured, [text, text])
+        finally:
+            _run(plugin.terminate())
+
+    def test_stream_delta_not_used_for_dedup(self):
+        # 流式增量不该进跨条去重，否则累计全文重发时会被整条剪掉
+        captured = []
+
+        async def orig_stream(self, generator, *a, **k):
+            async for chain in generator:
+                captured.append(chain.chain[0].text)
+            return "ok"
+
+        async def orig_send(self, message, *a, **k):
+            captured.append(message.chain[0].text if message.chain else "")
+            return "ok"
+
+        setattr(AstrMessageEvent, "send_streaming", orig_stream)
+        setattr(AstrMessageEvent, "send", orig_send)
+        plugin = HideThinking(context=None, config={"enabled": True, "dedup_window": 0})
+        try:
+            _run(plugin.initialize())
+
+            async def gen():
+                yield SimpleNamespace(chain=[Plain("今天天气真的很不错啊")])
+                yield SimpleNamespace(chain=[Plain("我们要不要出去走走看看")])
+
+            event = FakeEvent(umo="gs1")
+            _run(AstrMessageEvent.send_streaming(event, gen()))
+            full = "今天天气真的很不错啊我们要不要出去走走看看"
+            _run(AstrMessageEvent.send(event, SimpleNamespace(chain=[Plain(full)])))
+            self.assertEqual(
+                captured,
+                ["今天天气真的很不错啊", "我们要不要出去走走看看", full],
+            )
+        finally:
+            _run(plugin.terminate())
+
+    def test_llm_response_keeps_component_order(self):
+        pic = SimpleNamespace(text="[图片]")
+        chain = SimpleNamespace(chain=[Plain("看图<|eos|>"), pic, Plain("哈哈")])
+        resp = LLMResponse(completion_text="", result_chain=chain)
+        _run(self.plugin.on_llm_response(FakeEvent(), resp))
+        comps = chain.chain
+        self.assertEqual(len(comps), 3)
+        self.assertIs(comps[1], pic)
+        self.assertEqual(comps[0].text, "看图")
+        self.assertEqual(comps[2].text, "哈哈")
 
 
 if __name__ == "__main__":

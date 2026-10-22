@@ -45,9 +45,9 @@ _MD_THINK_BLOCK = re.compile(
 
 # AstrBot 本体: "🤔 思考: ...\n\n────\n"
 # 官方 r1-filter: "🤔思考：...\n\n"
-_INJECTED_HEAD = re.compile(
-    r"^\s*🤔\s*思考[:：][\s\S]*?(?:\n\s*────\s*\n|\n{2,})",
-)
+_INJECTED_HEAD = re.compile(r"^\s*🤔\s*思考[:：]")
+_INJECTED_RULE = re.compile(r"\n\s*────\s*\n")
+_INJECTED_BLANK = re.compile(r"\n{2,}")
 
 _EVENT_REASONING_KEY = "_llm_reasoning_content"
 
@@ -85,6 +85,10 @@ _TOOL_SCAFFOLD = re.compile(
     r")\s*$",
     re.IGNORECASE,
 )
+
+
+# 各事件类原始 send 方法，key=(id(cls), name)，重载后仍然认得出原件
+_PATCH_ORIGINS: dict[tuple[int, str], Any] = {}
 
 
 def _is_think_tag(name: str) -> bool:
@@ -126,10 +130,24 @@ def strip_think_tags(text: str) -> str:
 
 
 def strip_injected_reasoning(text: str) -> str:
-    """去掉已经被拼进正文开头的「🤔 思考:」块。"""
+    """去掉已经被拼进正文开头的「🤔 思考:」块。
+
+    优先按 AstrBot 自己的 ──── 分隔线切：思考正文里带空行时也只删一次，
+    不会只删掉开头一段、把剩下的推理留在正文里。
+    """
     if not text:
         return text
-    return _INJECTED_HEAD.sub("", text, count=1)
+    head = _INJECTED_HEAD.match(text)
+    if head is None:
+        return text
+    rest = text[head.end() :]
+    rule = _INJECTED_RULE.search(rest)
+    if rule is not None:
+        return rest[rule.end() :]
+    blank = _INJECTED_BLANK.search(rest)
+    if blank is not None:
+        return rest[blank.end() :]
+    return text
 
 
 def strip_special_tokens(text: str) -> str:
@@ -417,7 +435,7 @@ def _is_lark_reasoning_comp(comp: Any) -> bool:
     "astrbot_plugin_hide_thinking",
     "Zxin-Pro",
     "隐藏思考/结束符/工具调用泄漏和垃圾标签，并折叠整段复读",
-    "1.11.0",
+    "1.12.0",
     "https://github.com/Zxin-Pro/astrbot_plugin_hide_thinking",
 )
 class HideThinking(Star):
@@ -425,8 +443,9 @@ class HideThinking(Star):
         super().__init__(context)
         self.config = config if isinstance(config, dict) else {}
         self._patched: list[tuple[Any, str, Any]] = []
+        self._patched_keys: set[tuple[int, str]] = set()
         self._patching = False
-        self._recent: dict[str, list[tuple[float, str]]] = {}
+        self._recent: dict[str, list[tuple[float, str, str]]] = {}
         self._pending: dict[str, tuple[Any, Any, Any, Any]] = {}
         try:
             self._dedup_window = max(0.0, float(self.config.get("dedup_window", 6)))
@@ -498,11 +517,13 @@ class HideThinking(Star):
             return str(getter)
         return "default"
 
-    def _purge_recent(self, sid: str, now: float | None = None) -> list[str]:
+    def _purge_recent(
+        self, sid: str, now: float | None = None
+    ) -> list[tuple[float, str, str]]:
         now = time.monotonic() if now is None else now
         items = [
-            (ts, txt)
-            for ts, txt in self._recent.get(sid, [])
+            (ts, txt, src)
+            for ts, txt, src in self._recent.get(sid, [])
             if now - ts <= _RECENT_TTL and txt
         ]
         items = items[-_RECENT_MAX:]
@@ -510,25 +531,39 @@ class HideThinking(Star):
             self._recent[sid] = items
         else:
             self._recent.pop(sid, None)
-        return [txt for _, txt in reversed(items)]
+        return items
 
-    def _remember(self, sid: str, text: str) -> None:
+    def _recent_texts(self, sid: str, exclude_source: str | None = None) -> list[str]:
+        """取最近发过的文本（新的在前）。
+
+        exclude_source 跳过同一出口的旧文本：同一条出口重复说同样的话是正常回复，
+        只有「工具先发一遍、正文再发一遍」这种跨出口重复才需要剪掉。
+        """
+        return [
+            txt
+            for _, txt, src in reversed(self._purge_recent(sid))
+            if exclude_source is None or src != exclude_source
+        ]
+
+    def _remember(self, sid: str, text: str, source: str) -> None:
         text = (text or "").strip()
         if len(text) < _MIN_DUP_UNIT:
             return
         now = time.monotonic()
         items = [
-            (ts, txt)
-            for ts, txt in self._recent.get(sid, [])
+            (ts, txt, src)
+            for ts, txt, src in self._recent.get(sid, [])
             if now - ts <= _RECENT_TTL
         ]
-        items.append((now, text))
+        items.append((now, text, source))
         self._recent[sid] = items[-_RECENT_MAX:]
 
-    def _apply_recent_sid(self, sid: str, chain: list[Any]) -> list[Any]:
+    def _apply_recent_sid(
+        self, sid: str, chain: list[Any], source: str = "event"
+    ) -> list[Any]:
         if not self._collapse_duplicate() or not chain:
             return chain
-        recents = self._purge_recent(sid)
+        recents = self._recent_texts(sid, exclude_source=source)
         new_chain: list[Any] = []
         outgoing: list[str] = []
         for comp in chain:
@@ -541,7 +576,7 @@ class HideThinking(Star):
                 outgoing.append(cleaned)
             new_chain.append(comp)
         for text in outgoing:
-            self._remember(sid, text)
+            self._remember(sid, text, source)
         return new_chain
 
     def _clean(self, text: str) -> str:
@@ -577,7 +612,9 @@ class HideThinking(Star):
             new_chain.append(comp)
         return new_chain
 
-    def _scrub_message(self, message: Any, sid: str | None = None) -> Any:
+    def _scrub_message(
+        self, message: Any, sid: str | None = None, source: str = "event"
+    ) -> Any:
         if not self._enabled() or message is None:
             return message
         chain = getattr(message, "chain", None)
@@ -585,7 +622,7 @@ class HideThinking(Star):
             return message
         new_chain = self._scrub_chain(list(chain))
         if sid is not None:
-            new_chain = self._apply_recent_sid(sid, new_chain)
+            new_chain = self._apply_recent_sid(sid, new_chain, source)
         try:
             message.chain = new_chain
         except Exception:
@@ -607,11 +644,11 @@ class HideThinking(Star):
         )
 
     async def _flush_pending_message(
-        self, sid: str, flush: Any, message: Any
+        self, sid: str, flush: Any, message: Any, source: str = "context"
     ) -> None:
         chain = getattr(message, "chain", None)
         if chain is not None:
-            chain = self._apply_recent_sid(sid, list(chain))
+            chain = self._apply_recent_sid(sid, list(chain), source)
             if not chain:
                 return
             try:
@@ -629,44 +666,75 @@ class HideThinking(Star):
         item = self._pending.pop(sid, None)
         if not item:
             return
-        flush, message, task, _source = item
+        flush, message, task, source = item
         if task is not None:
             task.cancel()
-        await self._flush_pending_message(sid, flush, message)
+        await self._flush_pending_message(sid, flush, message, source)
+
+    def _pick_preferred(self, pending_text: str, new_text: str) -> bool:
+        """同句冲突时留哪条：True = 留新来的，False = 留之前挂着的。"""
+        prefer = self._dedup_prefer()
+        if prefer == "first":
+            return False
+        if prefer == "spaced":
+            return _ws_count(new_text) > _ws_count(pending_text)
+        return True
+
+    async def _absorb_pending(
+        self, sid: str, flush: Any, message: Any, source: str
+    ) -> bool:
+        """另一条出口挂着同句消息：按配置决定留哪条，返回 True 表示本条不必再发。"""
+        item = self._pending.get(sid)
+        if not item:
+            return False
+        p_flush, p_msg, p_task, p_source = item
+        if p_source == source:
+            return False
+        p_text = self._plain_text_of(p_msg)
+        i_text = self._plain_text_of(message)
+        if not p_text or not i_text or _compact(p_text) != _compact(i_text):
+            return False
+        self._pending.pop(sid, None)
+        if p_task is not None:
+            p_task.cancel()
+        if self._pick_preferred(p_text, i_text):
+            return False
+        await self._flush_pending_message(sid, p_flush, p_msg, p_source)
+        return True
 
     async def _buffer_message(
-        self, sid: str, flush: Any, message: Any, source: str = "event"
+        self, sid: str, flush: Any, message: Any, source: str = "context"
     ) -> bool:
         """纯文本消息进缓冲；同句不同空格只发更自然的那条。返回 True 表示已接管。"""
         item = self._pending.pop(sid, None)
         if item is not None:
-            p_flush, p_msg, p_task, _p_source = item
+            p_flush, p_msg, p_task, p_source = item
             if p_task is not None:
                 p_task.cancel()
             p_text = self._plain_text_of(p_msg)
             i_text = self._plain_text_of(message)
-            if p_text and _compact(p_text) == _compact(i_text):
-                prefer = self._dedup_prefer()
-                if prefer == "second":
-                    await self._flush_pending_message(sid, flush, message)
-                elif prefer == "first":
-                    await self._flush_pending_message(sid, p_flush, p_msg)
-                elif _ws_count(i_text) > _ws_count(p_text):
-                    await self._flush_pending_message(sid, flush, message)
+            if p_text and i_text and _compact(p_text) == _compact(i_text):
+                if self._pick_preferred(p_text, i_text):
+                    await self._flush_pending_message(sid, flush, message, source)
                 else:
-                    await self._flush_pending_message(sid, p_flush, p_msg)
+                    await self._flush_pending_message(sid, p_flush, p_msg, p_source)
                 return True
-            await self._flush_pending_message(sid, p_flush, p_msg)
+            await self._flush_pending_message(sid, p_flush, p_msg, p_source)
 
         async def _later() -> None:
-            await asyncio.sleep(self._dedup_window)
-            await self._flush_sid(sid)
+            try:
+                await asyncio.sleep(self._dedup_window)
+                await self._flush_sid(sid)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.error("[HideThinking] 缓冲超时发送失败", exc_info=True)
 
         try:
             task = asyncio.create_task(_later())
         except Exception:
             task = None
-            await self._flush_pending_message(sid, flush, message)
+            await self._flush_pending_message(sid, flush, message, source)
             return True
         self._pending[sid] = (flush, message, task, source)
         return True
@@ -687,18 +755,28 @@ class HideThinking(Star):
                 continue
 
     def _patch_method(self, cls: Any, name: str, factory) -> None:
-        orig = cls.__dict__.get(name)
-        if orig is None or getattr(orig, "_hide_thinking_patched", False):
+        key = (id(cls), name)
+        if key in self._patched_keys:
             return
+        orig = _PATCH_ORIGINS.get(key)
+        if orig is None:
+            current = cls.__dict__.get(name)
+            if current is None or not callable(current):
+                return
+            orig = current
+            _PATCH_ORIGINS[key] = orig
         wrapped = factory(orig)
-        wrapped._hide_thinking_patched = True
-        setattr(cls, name, wrapped)
-        self._patched.append((cls, name, orig))
+        try:
+            setattr(cls, name, wrapped)
+        except Exception:
+            return
+        self._patched_keys.add(key)
+        self._patched.append((cls, name, wrapped))
 
     def _install_send_patch(self) -> None:
-        if self._patched:
-            return
+        """装上 send 出口补丁；重复调用只会补上后来才加载的事件类。"""
         plugin = self
+        before = len(self._patched)
 
         def send_factory(orig):
             async def patched_send(event, message, *args, **kwargs):
@@ -719,14 +797,17 @@ class HideThinking(Star):
                         and plugin._collapse_duplicate()
                         and plugin._is_pure_plain(message)
                     ):
-                        await plugin._buffer_message(
-                            sid, lambda m: orig(event, m), message, "event"
-                        )
-                        return None
+                        try:
+                            if await plugin._absorb_pending(
+                                sid, lambda m: orig(event, m), message, "event"
+                            ):
+                                return None
+                        except Exception:
+                            logger.error("[HideThinking] send 去重失败", exc_info=True)
                     try:
                         chain = getattr(message, "chain", None)
                         if chain is not None:
-                            chain = plugin._apply_recent_sid(sid, list(chain))
+                            chain = plugin._apply_recent_sid(sid, list(chain), "event")
                             if not chain:
                                 return None
                             message.chain = chain
@@ -754,6 +835,8 @@ class HideThinking(Star):
                     except Exception:
                         sid = None
                     if sid:
+                        # 工具主动发的那条先挂起来，等正文来替换；
+                        # 只有这条路会缓冲，正常回复不延迟。
                         if (
                             plugin._dedup_window > 0
                             and plugin._collapse_duplicate()
@@ -769,7 +852,9 @@ class HideThinking(Star):
                         try:
                             chain = getattr(message_chain, "chain", None)
                             if chain is not None:
-                                chain = plugin._apply_recent_sid(sid, list(chain))
+                                chain = plugin._apply_recent_sid(
+                                    sid, list(chain), "context"
+                                )
                                 if not chain:
                                     return True
                                 message_chain.chain = chain
@@ -785,12 +870,13 @@ class HideThinking(Star):
             async def patched_send_streaming(event, generator, *args, **kwargs):
                 if not plugin._enabled() or generator is None:
                     return await orig(event, generator, *args, **kwargs)
-                sid = plugin._session_key(event)
 
                 async def cleaned_gen():
                     async for chain in generator:
                         try:
-                            chain = plugin._scrub_message(chain, sid)
+                            # 流式每一片都是增量，只清洗、不参与跨条去重，
+                            # 否则累计全文重发时会被当成"重复尾巴"整条剪掉。
+                            chain = plugin._scrub_message(chain)
                             inner = getattr(chain, "chain", None)
                             if inner is not None and len(inner) == 0:
                                 continue
@@ -807,21 +893,32 @@ class HideThinking(Star):
             self._patch_method(cls, "send_streaming", stream_factory)
         if _StarContext is not None:
             self._patch_method(_StarContext, "send_message", ctx_send_factory)
-        logger.info("[HideThinking] 已拦截 %s 个 send 出口", len(self._patched))
+        if len(self._patched) > before:
+            logger.info("[HideThinking] 已拦截 %s 个 send 出口", len(self._patched))
 
     def _remove_send_patch(self) -> None:
-        for cls, name, orig in reversed(self._patched):
+        for cls, name, wrapped in reversed(self._patched):
             try:
-                setattr(cls, name, orig)
+                # 只摘自己装的那层；别人（新实例）装上去的别动
+                if getattr(cls, name, None) is not wrapped:
+                    continue
+                original = _PATCH_ORIGINS.pop((id(cls), name), None)
+                if original is not None:
+                    setattr(cls, name, original)
             except Exception:
                 continue
         self._patched.clear()
+        self._patched_keys.clear()
 
     @filter.on_llm_request(priority=-100)
     async def on_llm_request(self, event: AstrMessageEvent, req: Any):
-        """新一轮流式开始：把上一轮遗留的缓冲立刻发出去。"""
+        """新一轮请求：补打后加载的事件类，并把上一轮遗留的缓冲立刻发出去。"""
         if not self._enabled():
             return
+        try:
+            self._install_send_patch()
+        except Exception:
+            logger.error("[HideThinking] 补装 send 补丁失败", exc_info=True)
         try:
             sid = self._session_key(event)
             if sid in self._pending:
@@ -831,16 +928,31 @@ class HideThinking(Star):
 
     @filter.on_agent_done(priority=-100)
     async def on_agent_done(self, event: AstrMessageEvent, *args, **kwargs):
-        """一轮 agent 结束：把本轮走 event.send 的缓冲立刻发出，避免等窗口。
+        """一轮 agent 结束：挂着的那条工具消息，正文会替代就等，不会就立刻发。
 
-        工具（Context.send_message）那条先挂着的保留着，等正文来替换，否则第二条空格版会被丢掉。
+        这样既不会让工具消息干等窗口，也不会抢在正文前面把重复内容发两遍。
         """
         if not self._enabled():
             return
         try:
             sid = self._session_key(event)
-            if sid in self._pending:
-                await self._flush_sid(sid, only_source="event")
+            item = self._pending.get(sid)
+            if not item:
+                return
+            resp = args[1] if len(args) > 1 else kwargs.get("response")
+            if resp is None:
+                # 拿不到最终正文；留给正文或超时兜底
+                return
+            final_text = str(getattr(resp, "completion_text", "") or "")
+            pending_text = self._plain_text_of(item[1])
+            if (
+                final_text
+                and pending_text
+                and _compact(final_text).endswith(_compact(pending_text))
+            ):
+                # 正文里已经带上了这句，等正文发出去替代它
+                return
+            await self._flush_sid(sid)
         except Exception:
             logger.error("[HideThinking] 结束轮冲刷失败", exc_info=True)
 
@@ -861,11 +973,18 @@ class HideThinking(Star):
         if not self._enabled() or resp is None:
             return
         try:
-            text = getattr(resp, "completion_text", None)
-            if text:
-                cleaned = self._clean(str(text))
-                if cleaned != str(text):
-                    resp.completion_text = cleaned
+            chain = getattr(resp, "result_chain", None)
+            inner = getattr(chain, "chain", None)
+            if inner:
+                # 直接清链上的 Plain，别走 completion_text setter：
+                # 那个 setter 会删光 Plain 再把整段文本插到最前面，图文顺序会被打乱。
+                chain.chain = self._scrub_chain(list(inner))
+            else:
+                text = getattr(resp, "completion_text", None)
+                if text:
+                    cleaned = self._clean(str(text))
+                    if cleaned != str(text):
+                        resp.completion_text = cleaned
             self._clear_reasoning(event, resp)
         except Exception:
             logger.error("[HideThinking] 处理 LLM 响应失败", exc_info=True)

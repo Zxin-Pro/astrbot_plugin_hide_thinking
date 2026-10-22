@@ -26,7 +26,7 @@
   "collapse_duplicate": {
     "description": "折叠整段复读",
     "type": "bool",
-    "hint": "同一句话被粘两遍时只留一句；分段发出后，后一条把前一条接在尾巴上也会剪掉。",
+    "hint": "同一句话被粘两遍时只留一句；工具先发一遍、正文再发一遍时只留一条。同一条出口重复说同样的话不会被吞。",
     "default": true
   },
   "strip_tool_call": {
@@ -52,15 +52,23 @@
   "dedup_window": {
     "description": "跨条去重等待窗口（秒）",
     "type": "int",
-    "hint": "纯文本消息缓冲 N 秒再发：同一句话两种写法先后到达时按「保留哪条」合并；0 关闭缓冲立即发送。正常回复会在本轮发送结束后立刻冲刷，不受此值拖慢。",
+    "hint": "工具主动发送（send_message_to_user）的纯文本先缓冲 N 秒，等正文来替代；正常回复不缓冲、不延迟。0 关闭缓冲立即发送。",
     "default": 6
   },
   "dedup_prefer": {
     "description": "重复时保留哪条",
     "type": "string",
-    "options": ["second", "first", "spaced"],
-    "labels": ["第二遍（推荐）", "第一遍", "空格多的那条"],
-    "hint": "同一句话先后到达两次时保留哪条：second=第二遍（工具调用先发、正文后发时留正文），first=第一遍，spaced=空格更多的那条。",
+    "options": [
+      "second",
+      "first",
+      "spaced"
+    ],
+    "labels": [
+      "第二遍（推荐）",
+      "第一遍",
+      "空格多的那条"
+    ],
+    "hint": "工具消息和正文重复时保留哪条：second=第二遍（正文，推荐）、first=第一遍、spaced=空格更多的那条。",
     "default": "second"
   }
 }
