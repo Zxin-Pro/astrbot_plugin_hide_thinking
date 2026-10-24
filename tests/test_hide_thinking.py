@@ -1173,6 +1173,40 @@ class TestPluginHooks(unittest.TestCase):
         self.assertEqual(comps[0].text, "看图")
         self.assertEqual(comps[2].text, "哈哈")
 
+    def test_stream_thinking_split_across_chunks(self):
+        # 标签被切片切断时，整段思考都不能漏出来
+        captured = []
+
+        async def orig_stream(self, generator, *a, **k):
+            async for chain in generator:
+                captured.append(chain.chain[0].text if chain.chain else "")
+            return "ok"
+
+        setattr(AstrMessageEvent, "send_streaming", orig_stream)
+        plugin = HideThinking(context=None, config={"enabled": True, "dedup_window": 0})
+        try:
+            _run(plugin.initialize())
+
+            async def gen():
+                yield SimpleNamespace(chain=[Plain("<thin")])
+                yield SimpleNamespace(chain=[Plain("king>秘密思考")])
+                yield SimpleNamespace(chain=[Plain("</thinking>对外正文")])
+
+            _run(AstrMessageEvent.send_streaming(FakeEvent(umo="gst1"), gen()))
+        finally:
+            _run(plugin.terminate())
+        self.assertEqual("".join(captured).strip(), "对外正文")
+        self.assertNotIn("秘密思考", "".join(captured))
+
+    def test_node_content_scrubbed(self):
+        # 合并转发（Node）里的正文也要清
+        inner = SimpleNamespace(content=[Plain("<thinking>暗想</thinking>节点正文")])
+        event = FakeEvent(chain=[inner, Plain("外层正文")])
+        _run(self.plugin.on_decorating_result(event))
+        comps = event.get_result().chain
+        self.assertEqual(comps[0].content[0].text, "节点正文")
+        self.assertEqual(comps[1].text, "外层正文")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

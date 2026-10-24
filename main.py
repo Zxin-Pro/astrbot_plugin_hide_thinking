@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import importlib
 import json
 import re
 import time
@@ -13,10 +14,27 @@ from astrbot.api.message_components import Plain
 from astrbot.api.provider import LLMResponse
 from astrbot.api.star import Context, Star, register
 
-try:  # 工具/插件主动发送走 Context.send_message，需要一并接管
-    from astrbot.core.star.context import Context as _StarContext
-except Exception:  # pragma: no cover - 老版本兜底
-    _StarContext = None
+# 工具/插件主动发送走 Context.send_message，需要一并接管；
+# 不同版本 Context 所在模块不一样，这里把能找到的都记下来。
+_STAR_CONTEXTS: list[type] = []
+for _ctx_path in (
+    "astrbot.core.star.context",
+    "astrbot.core.plugin.context",
+    "astrbot.api.star",
+):
+    try:
+        _ctx_cls = getattr(importlib.import_module(_ctx_path), "Context", None)
+        if isinstance(_ctx_cls, type) and _ctx_cls not in _STAR_CONTEXTS:
+            _STAR_CONTEXTS.append(_ctx_cls)
+    except Exception:  # pragma: no cover - 版本兜底
+        continue
+
+try:  # Context.send_message 最后都落到平台出口
+    from astrbot.core.platform.platform import Platform as _PlatformBase
+except Exception:  # pragma: no cover
+    _PlatformBase = None
+
+_StarContext = _STAR_CONTEXTS[0] if _STAR_CONTEXTS else None
 
 # 模型常见思维链标签（英文 + 中文）
 _THINK_TAG_NAMES = frozenset(
@@ -51,6 +69,57 @@ _INJECTED_BLANK = re.compile(r"\n{2,}")
 
 _EVENT_REASONING_KEY = "_llm_reasoning_content"
 
+
+# 流式增量里被截断的标签尾巴，例如 "<thin"
+_PARTIAL_TAG = re.compile(r"<[^>]*$")
+
+
+def _filter_stream_text(text: str, state: dict[str, Any]) -> str:
+    """流式每一片单独清洗时，跨片的 <think> 块会漏：
+
+    第一片 "<thinking>秘" 能被删掉，后面的 "密</thinking>正文" 就成了普通正文。
+    这里按片累积状态，标签没闭合之前的文字一律不往外发。
+    """
+    buf = state.get("pending", "") + (text or "")
+    state["pending"] = ""
+    out: list[str] = []
+    i = 0
+    n = len(buf)
+    while i < n:
+        if state.get("depth", 0) > 0:
+            m = _ANY_TAG.search(buf, i)
+            if m is None:
+                tail = buf[i:]
+                partial = _PARTIAL_TAG.search(tail)
+                state["pending"] = tail[partial.start() :] if partial else ""
+                return "".join(out)
+            if _is_think_tag(m.group(2) or ""):
+                if m.group(1) == "/":
+                    state["depth"] = max(0, state["depth"] - 1)
+                else:
+                    state["depth"] += 1
+            i = m.end()
+            continue
+
+        m = _ANY_TAG.search(buf, i)
+        if m is None:
+            tail = buf[i:]
+            partial = _PARTIAL_TAG.search(tail)
+            if partial is not None:
+                state["pending"] = tail[partial.start() :]
+                tail = tail[: partial.start()]
+            out.append(tail)
+            return "".join(out)
+
+        out.append(buf[i : m.start()])
+        if _is_think_tag(m.group(2) or ""):
+            if m.group(1) != "/":
+                state["depth"] = 1
+            i = m.end()
+            continue
+        out.append(buf[m.start() : m.end()])
+        i = m.end()
+    return "".join(out)
 # 模型结束符 / 控制符漏进正文：<|eos|> <|im_end|> </s> 等
 _SPECIAL_TOKEN = re.compile(
     r"<\|[^|>]{1,64}\|>"
@@ -435,7 +504,7 @@ def _is_lark_reasoning_comp(comp: Any) -> bool:
     "astrbot_plugin_hide_thinking",
     "Zxin-Pro",
     "隐藏思考/结束符/工具调用泄漏和垃圾标签，并折叠整段复读",
-    "1.12.0",
+    "1.12.1",
     "https://github.com/Zxin-Pro/astrbot_plugin_hide_thinking",
 )
 class HideThinking(Star):
@@ -447,6 +516,7 @@ class HideThinking(Star):
         self._patching = False
         self._recent: dict[str, list[tuple[float, str, str]]] = {}
         self._pending: dict[str, tuple[Any, Any, Any, Any]] = {}
+        self._stream_state: dict[str, dict[str, Any]] = {}
         try:
             self._dedup_window = max(0.0, float(self.config.get("dedup_window", 6)))
         except Exception:
@@ -609,6 +679,14 @@ class HideThinking(Star):
                     continue
                 if cleaned != comp.text:
                     comp.text = cleaned
+            else:
+                # 合并转发（Node）之类容器里的正文也要清，否则标签原样带出去
+                inner = getattr(comp, "content", None)
+                if isinstance(inner, list) and inner:
+                    try:
+                        comp.content = self._scrub_chain(inner)
+                    except Exception:
+                        pass
             new_chain.append(comp)
         return new_chain
 
@@ -870,12 +948,22 @@ class HideThinking(Star):
             async def patched_send_streaming(event, generator, *args, **kwargs):
                 if not plugin._enabled() or generator is None:
                     return await orig(event, generator, *args, **kwargs)
+                sid = plugin._session_key(event)
+                state = plugin._stream_state.setdefault(
+                    sid, {"depth": 0, "pending": ""}
+                )
 
                 async def cleaned_gen():
                     async for chain in generator:
                         try:
-                            # 流式每一片都是增量，只清洗、不参与跨条去重，
-                            # 否则累计全文重发时会被当成"重复尾巴"整条剪掉。
+                            # 先按片累积过滤掉跨片的 <think> 块，再走常规清洗；
+                            # 顺序反了的话，孤立的 </thinking> 会先被当垃圾标签删掉，
+                            # 后面的正文就会一直卡在思考状态里发不出去。
+                            raw = getattr(chain, "chain", None)
+                            if raw:
+                                for comp in raw:
+                                    if isinstance(comp, Plain) and comp.text is not None:
+                                        comp.text = _filter_stream_text(comp.text, state)
                             chain = plugin._scrub_message(chain)
                             inner = getattr(chain, "chain", None)
                             if inner is not None and len(inner) == 0:
@@ -884,15 +972,42 @@ class HideThinking(Star):
                             logger.error("[HideThinking] 流式清洗失败", exc_info=True)
                         yield chain
 
-                return await orig(event, cleaned_gen(), *args, **kwargs)
+                try:
+                    return await orig(event, cleaned_gen(), *args, **kwargs)
+                finally:
+                    plugin._stream_state.pop(sid, None)
 
             return patched_send_streaming
 
         for cls in self._iter_event_classes():
             self._patch_method(cls, "send", send_factory)
             self._patch_method(cls, "send_streaming", stream_factory)
-        if _StarContext is not None:
-            self._patch_method(_StarContext, "send_message", ctx_send_factory)
+        for ctx_cls in _STAR_CONTEXTS:
+            self._patch_method(ctx_cls, "send_message", ctx_send_factory)
+        if not _STAR_CONTEXTS and _PlatformBase is not None:
+            # 没找到 Context 类（版本差异）时退而求其次，直接在平台出口清洗
+            def platform_send_factory(orig):
+                async def patched_platform_send(
+                    pl_self, session, message_chain, *a, **k
+                ):
+                    if plugin._enabled() and not plugin._patching:
+                        plugin._patching = True
+                        try:
+                            message_chain = plugin._scrub_message(message_chain)
+                            chain = getattr(message_chain, "chain", None)
+                            if chain is not None and len(chain) == 0:
+                                return None
+                        except Exception:
+                            logger.error(
+                                "[HideThinking] platform send 清洗失败", exc_info=True
+                            )
+                        finally:
+                            plugin._patching = False
+                    return await orig(pl_self, session, message_chain, *a, **k)
+
+                return patched_platform_send
+
+            self._patch_method(_PlatformBase, "send_by_session", platform_send_factory)
         if len(self._patched) > before:
             logger.info("[HideThinking] 已拦截 %s 个 send 出口", len(self._patched))
 
